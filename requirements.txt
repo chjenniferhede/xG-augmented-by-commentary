@@ -1,3 +1,11 @@
+# One environment for everything (use a venv: rapidocr pulls in numpy 2 / OpenCV).
 pandas
 requests
+numpy
 youtube-transcript-api
+yt-dlp
+imageio-ffmpeg
+rapidocr_onnxruntime
+flask
+python-dotenv
+psycopg[binary]==3.2.*   # Postgres (Supabase) when DATABASE_URL is set

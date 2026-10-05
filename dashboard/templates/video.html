@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block content %}
+<p><a href="{{ url_for('videos') }}">← Videos</a></p>
+<h1>{{ v.title or v.video_id }}</h1>
+<p><span class="tag {{ v.state }}">{{ v.state }}</span>
+   <span class="muted">· {{ v.video_id }} · published {{ (v.published_at or "")[:10] }} ·</span>
+   <a href="https://www.youtube.com/watch?v={{ v.video_id }}" target="_blank" rel="noopener">YouTube ↗</a></p>
+{% if busy %}<div class="banner info">A run is in progress (see <a href="{{ url_for('index') }}">Overview</a>); actions are off until it finishes.</div>{% endif %}
+{% if cooldown %}<div class="banner info">Scheduled runs are paused from YouTube until {{ cooldown }} after a block. Actions here ignore the pause.</div>{% endif %}
+{% if v.last_error %}<div class="banner bad"><b>Last error</b><pre style="margin:6px 0 0;white-space:pre-wrap">{{ v.last_error|pretty_json }}</pre></div>{% endif %}
+
+<form method="post" action="{{ url_for('process_videos') }}" class="toolbar">
+  <input type="hidden" name="video_ids" value="{{ v.video_id }}">
+  <input type="hidden" name="back" value="{{ url_for('video_page', video_id=v.video_id) }}">
+  {% for key, label in stages.items() %}
+  <button name="stage" value="{{ key }}" class="{{ '' if key == 'align' else 'secondary' }}" {% if busy %}disabled{% endif %}>{{ label }}</button>
+  {% endfor %}
+</form>
+
+<h2>Game</h2>
+{% if game %}
+<dl class="kv">
+  <dt>Game</dt><dd>{{ game[2] }} {{ game[4] }} @ {{ game[3] }} {{ game[5] }}{% if game[6] and game[6] != 'REG' %} ({{ game[6] }}){% endif %}</dd>
+  <dt>Date</dt><dd>{{ game[1] }} · {{ game[7] }}{% if game[8] %} · {{ game[8] }}{% endif %}</dd>
+  <dt>NHL game ID</dt><dd>{{ game[0] }}</dd>
+  {% for label, n in counts.items() %}<dt>{{ label|capitalize }}</dt><dd>{{ n }}</dd>{% endfor %}
+</dl>
+{% elif v.game_id %}<p>NHL game {{ v.game_id }} <span class="muted">(not loaded yet)</span></p>
+{% else %}<p class="muted">No game yet: it's found from the title when captions are fetched.</p>{% endif %}
+<form method="post" action="{{ url_for('set_game', video_id=v.video_id) }}" class="inline" style="margin-top:12px">
+  <label for="game_id">{{ 'Change game' if v.game_id else 'Set game' }}</label>
+  <input id="game_id" name="game_id" inputmode="numeric" placeholder="NHL game ID" value="">
+  <button class="secondary" {% if busy %}disabled{% endif %}>Save</button>
+  <span class="muted">Sends the video back to the caption stage under that game.</span>
+</form>
+
+<h2>Files</h2>
+<div class="wrap"><table>
+  <tr><th>File</th><th>Path (under data/)</th><th>Size</th><th>Modified</th></tr>
+  {% for f in files %}
+  <tr><td>{{ f.label }}</td><td><code>{{ f.path }}</code></td>
+      <td>{% if f.size is not none %}{{ '%.0f'|format(f.size / 1024) }} KB{% else %}<span class="muted">missing</span>{% endif %}</td>
+      <td class="muted">{{ f.modified or "" }}</td></tr>
+  {% endfor %}
+  <tr><td>Scoreboard crops</td><td><code>raw/youtube/frames/{{ v.video_id }}/</code></td>
+      <td>{% if frames %}{{ frames }} frames{% elif v.state == 'aligned' and files[-1].size is not none %}<span class="muted">deleted after alignment</span>{% else %}0 frames{% endif %}</td>
+      <td class="muted">{% if not frames and v.state == 'aligned' %}OCR text kept in index.json{% endif %}</td></tr>
+</table></div>
+
+<h2>Alignment</h2>
+{% if alignment %}
+<dl class="kv">
+  <dt>Result</dt><dd class="{{ 'ok' if alignment.passed else 'partial' }}">{{ 'passed' if alignment.passed else 'not passed' }}</dd>
+  <dt>Segments pinned by the clock</dt><dd>{{ alignment.pinned_by_clock }} / {{ alignment.segments }} ({{ '%.0f'|format(alignment.coverage * 100) }}%, needs 90%)</dd>
+  {% if alignment.clock_reversals is defined %}
+  <dt>Clock read going backwards</dt><dd>{{ alignment.clock_reversals }} of {{ alignment.readings }} readings (needs ≤ 1%)</dd>
+  {% else %}
+  <dt>Largest offset drop</dt><dd>{{ alignment.max_offset_drop }} s <span class="muted">(older check)</span></dd>
+  {% endif %}
+  {% if alignment.video_cuts is defined %}<dt>Cuts in the video</dt><dd>{{ alignment.video_cuts }}</dd>{% endif %}
+  <dt>Score matches MoneyPuck</dt><dd>{% if alignment.score_match is not none %}{{ '%.0f'|format(alignment.score_match * 100) }}% of {{ alignment.score_readings }} readings{% else %}no readable score{% endif %}</dd>
+  <dt>Frames</dt><dd>{{ alignment.frames_cached }} read, {{ alignment.frames_fetched }} fetched in that run</dd>
+</dl>
+{% else %}<p class="muted">Not aligned yet.</p>{% endif %}
+
+<h2>History</h2>
+<div class="wrap"><table>
+  <tr><th>Run</th><th>Stage</th><th>Started (UTC)</th><th>Status</th><th>YouTube requests</th><th>Note</th></tr>
+  {% for s in steps %}
+  <tr><td>{% if s[0] %}<a href="{{ url_for('run_page', run_id=s[0]) }}">#{{ s[0] }}</a>{% endif %}</td><td>{{ s[1] }}</td>
+      <td>{{ s[2] }}</td><td class="{{ s[3] }}">{{ s[3] }}</td><td>{{ s[5] or 0 }}</td>
+      <td class="muted"><code>{{ (s[4] or "")[:160] }}</code></td></tr>
+  {% else %}<tr><td colspan="6" class="muted">Nothing run for this video yet.</td></tr>{% endfor %}
+</table></div>
+{% endblock %}

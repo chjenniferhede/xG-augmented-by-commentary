@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Pipeline</h1>
+{% if running %}<div class="banner info">A run is in progress. This page refreshes every 5 seconds.</div>{% endif %}
+{% if cooldown %}
+<div class="banner bad">Scheduled runs: YouTube paused until {{ cooldown }} after a block ({{ block_reason }}).
+  Runs you start here ignore the pause and the rate limits.</div>
+{% endif %}
+
+<form method="post" action="{{ url_for('start_run') }}">
+  <button name="mode" value="transcripts" {% if running %}disabled{% endif %}>Fetch new transcripts</button>
+  <button class="secondary" name="mode" value="full" {% if running %}disabled{% endif %}>Full run (with alignment)</button>
+  <span class="muted">Runs started here aren't rate-limited; the weekly scheduled run is (at most {{ budget }} YouTube requests).</span>
+</form>
+
+<h2>Database Data</h2>
+<div class="cards">
+  <div class="card"><b>{{ warehouse.games or 0 }}</b>game captions</div>
+  <div class="card"><b>{{ warehouse.with_events or 0 }}</b>with moneypuck events</div>
+  <div class="card"><b>{{ warehouse.aligned or 0 }}</b>aligned to video</div>
+  <div class="card"><b>{{ warehouse.shots or 0 }}</b>shots</div>
+</div>
+
+<h2>Queue</h2>
+<div class="cards">
+  {% for state, n in queue %}<a class="card" href="{{ url_for('videos', state=state) }}" style="text-decoration:none;color:inherit"><b>{{ n }}</b>{{ state }}</a>{% else %}<span class="muted">No videos yet{% if not full_scan_done %}; the first discovery scans the NHL channel's whole catalog{% endif %}.</span>{% endfor %}
+</div>
+
+<h2>Request usage</h2>
+<div class="wrap"><table>
+  <tr><th>Group</th><th>Min spacing</th><th>Last hour</th><th>Hourly cap</th><th>Last 24 h</th></tr>
+  {% for u in usage %}
+  <tr><td><code>{{ u.group }}</code></td><td>{{ u.interval }} s</td><td>{{ u.hour }}</td>
+      <td>{{ u.per_hour or "—" }}</td><td>{{ u.day }}</td></tr>
+  {% endfor %}
+</table></div>
+
+<h2>Recent runs</h2>
+<div class="wrap"><table>
+  <tr><th>#</th><th>Trigger</th><th>Command</th><th>Started (UTC)</th><th>Status</th><th>Summary</th></tr>
+  {% for r in runs %}
+  <tr><td><a href="{{ url_for('run_page', run_id=r[0]) }}">{{ r[0] }}</a></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td>
+      <td>{{ r[3] }}</td><td class="{{ r[5] }}">{{ r[5] }}</td><td class="muted"><code>{{ (r[6] or "")[:140] }}</code></td></tr>
+  {% else %}<tr><td colspan="6" class="muted">No runs yet.</td></tr>{% endfor %}
+</table></div>
+{% endblock %}

@@ -1,96 +1,144 @@
-"""Pull MoneyPuck data for one NHL game and store it in SQLite.
+"""Load MoneyPuck's events and shots for one NHL game into the warehouse.
 
-Default: Canadiens @ Sharks, Mar 3, 2026 (NHL game id 2025020969).
-
-Sources:
+Sources (kept in data/raw/moneypuck/):
   - Play-by-play: https://moneypuck.com/moneypuck/gameData/{season}/{game_id}.csv
   - Shots:        https://peter-tanner.com/moneypuck/downloads/shots_{season_start}.zip
 
-Usage: python scripts/build_db.py [nhl_game_id]
+A game's play-by-play file is downloaded once. The season shot zip grows during the season,
+so it is re-downloaded (overwritten) when the game isn't in it and the copy is over a day old.
+
+Usage: python scripts/build_db.py <nhl_game_id>
 """
 import io
-import sqlite3
 import sys
+import time
 import zipfile
-from pathlib import Path
 
 import pandas as pd
 import requests
 
-ROOT = Path(__file__).resolve().parent.parent
-RAW_DIR = ROOT / "data" / "raw"
-DB_PATH = ROOT / "data" / "moneypuck.sqlite"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+import db
+import ops
+import paths
+import ratelimit
+import raw_store
+from games import upsert_game
+
+HEADERS = {"User-Agent": "xG-augmented-by-commentary (research)"}
+SHOTS_REFRESH_AFTER = 86400  # seconds
 
 
-def fetch(url: str, dest: Path) -> Path:
-    if not dest.exists():
-        print(f"Downloading {url}")
-        resp = requests.get(url, headers=HEADERS, timeout=120)
+class GameDataMissing(Exception):
+    """MoneyPuck has no data for this game (yet)."""
+
+
+def download(url: str, path) -> None:
+    with ratelimit.request("moneypuck", url):
+        resp = requests.get(url, headers=HEADERS, timeout=180)
+        if resp.status_code == 404:
+            raise GameDataMissing(f"MoneyPuck has no file at {url}")
         resp.raise_for_status()
-        dest.write_bytes(resp.content)
-    return dest
+    raw_store.write_bytes(path, resp.content)
+    ops.log.info("downloaded %s (%d KB)", url, len(resp.content) // 1024)
 
 
-def load_events(nhl_game_id: int) -> pd.DataFrame:
-    season_start = nhl_game_id // 1_000_000
-    season = f"{season_start}{season_start + 1}"
-    path = fetch(
-        f"https://moneypuck.com/moneypuck/gameData/{season}/{nhl_game_id}.csv",
-        RAW_DIR / f"{nhl_game_id}.csv",
-    )
+def events_source(game_id: int):
+    season_start = game_id // 1_000_000
+    url = f"https://moneypuck.com/moneypuck/gameData/{season_start}{season_start + 1}/{game_id}.csv"
+    return url, paths.MONEYPUCK / "games" / f"{season_start}{season_start + 1}" / f"{game_id}.csv"
+
+
+def shots_source(game_id: int):
+    season_start = game_id // 1_000_000
+    url = f"https://peter-tanner.com/moneypuck/downloads/shots_{season_start}.zip"
+    return url, paths.MONEYPUCK / f"shots_{season_start}.zip"
+
+
+def load_events(game_id: int) -> pd.DataFrame:
+    url, path = events_source(game_id)
+    if not path.exists():
+        download(url, path)
     events = pd.read_csv(path)
     events = events.rename(columns={"id": "event_id"})
-    events.insert(0, "game_id", nhl_game_id)
-    return events
+    return pd.concat([pd.Series(game_id, index=events.index, name="game_id"), events], axis=1)
 
 
-def load_shots(nhl_game_id: int) -> pd.DataFrame:
-    season_start = nhl_game_id // 1_000_000
-    path = fetch(
-        f"https://peter-tanner.com/moneypuck/downloads/shots_{season_start}.zip",
-        RAW_DIR / f"shots_{season_start}.zip",
-    )
+def read_shots(path, game_id: int) -> pd.DataFrame:
+    season_start = game_id // 1_000_000
     with zipfile.ZipFile(path) as zf:
         with zf.open(f"shots_{season_start}.csv") as f:
             shots = pd.read_csv(io.TextIOWrapper(f), low_memory=False)
     # MoneyPuck's game_id drops the season prefix (e.g. 20969 for 2025020969).
-    shots = shots[(shots["season"] == season_start) & (shots["game_id"] == nhl_game_id % 1_000_000)].copy()
-    shots = shots.rename(columns={"id": "event_id", "shotID": "moneypuck_shot_id"})
-    shots["game_id"] = nhl_game_id
-    return shots
+    return shots[(shots["season"] == season_start) & (shots["game_id"] == game_id % 1_000_000)].copy()
 
 
-def build(nhl_game_id: int) -> None:
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    events = load_events(nhl_game_id)
-    shots = load_shots(nhl_game_id)
+def load_shots(game_id: int) -> pd.DataFrame:
+    url, path = shots_source(game_id)
+    if not path.exists():
+        download(url, path)
+    shots = read_shots(path, game_id)
+    if shots.empty and time.time() - path.stat().st_mtime > SHOTS_REFRESH_AFTER:
+        ops.log.info("game %s not in cached %s; refreshing it", game_id, path.name)
+        download(url, path)
+        shots = read_shots(path, game_id)
     if shots.empty:
-        raise SystemExit(f"No MoneyPuck shots found for game {nhl_game_id}")
+        raise GameDataMissing(f"No MoneyPuck shots for game {game_id} in {path.name}")
+    shots = shots.rename(columns={"id": "event_id", "shotID": "moneypuck_shot_id"}).drop(columns="game_id")
+    return pd.concat([pd.Series(game_id, index=shots.index, name="game_id"), shots], axis=1)
 
-    with sqlite3.connect(DB_PATH) as con:
-        # Replace any previous load of this game so the script is re-runnable.
-        for table in ("events", "shots"):
-            exists = con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-            ).fetchone()
-            if exists:
-                con.execute(f"DELETE FROM {table} WHERE game_id = ?", (nhl_game_id,))
 
-        events.to_sql("events", con, if_exists="append", index=False)
-        shots.to_sql("shots", con, if_exists="append", index=False)
+def insert_frame(con, table: str, df: pd.DataFrame, load_id: str) -> None:
+    """Insert only the columns the schema defines; report any MoneyPuck adds."""
+    columns = [c for c in db.table_columns(con, table)
+               if c not in ("load_id", "calibrated_transcript_time", "alignment_load_id")]
+    # Postgres stores MoneyPuck's camelCase names in lowercase: match names ignoring case.
+    df = df.rename(columns={c: c.lower() for c in df.columns}) if columns == [c.lower() for c in columns] else df
+    extra = sorted(set(df.columns) - set(columns))
+    if extra:
+        ops.log.info("%s: ignoring %d columns not in the schema: %s", table, len(extra), ", ".join(extra[:10]))
+    df = df.reindex(columns=columns)
+    # Plain Python values (neither driver binds numpy scalars); NaN becomes NULL; True/False
+    # become 1/0 (the flag columns are integers, and Postgres won't take a boolean there).
+    values = [[None if pd.isna(v) else int(v) if isinstance(v, bool) else v for v in df[c].tolist()]
+              for c in columns]
+    cols = columns + ["load_id"]
+    con.executemany(
+        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+        [(*row, load_id) for row in zip(*values)],
+    )
 
-        con.executescript(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_events_game_event ON events (game_id, event_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_shots_game_event ON shots (game_id, event_id);
-            CREATE INDEX IF NOT EXISTS ix_shots_team ON shots (game_id, teamCode);
-            CREATE INDEX IF NOT EXISTS ix_shots_shooter ON shots (shooterPlayerId);
-            """
+
+def build(game_id: int) -> None:
+    events = load_events(game_id)
+    shots = load_shots(game_id)
+    (events_url, events_path), (shots_url, shots_path) = events_source(game_id), shots_source(game_id)
+
+    con = db.connect("warehouse")
+    with con:
+        # Reloading keeps the events' alignment to the video (it depends only on the video).
+        aligned = con.execute(
+            "SELECT calibrated_transcript_time, alignment_load_id, game_id, event_id FROM events "
+            "WHERE game_id = ? AND alignment_load_id IS NOT NULL",
+            (game_id,),
+        ).fetchall()
+        con.execute("DELETE FROM events WHERE game_id = ?", (game_id,))
+        con.execute("DELETE FROM shots WHERE game_id = ?", (game_id,))
+
+        upsert_game(con, game_id)
+        insert_frame(con, "events", events,
+                     db.new_load(con, "events", game_id=game_id, raw_files=[events_path], source_urls=[events_url]))
+        insert_frame(con, "shots", shots,
+                     db.new_load(con, "shots", game_id=game_id, raw_files=[shots_path], source_urls=[shots_url]))
+        con.executemany(
+            "UPDATE events SET calibrated_transcript_time = ?, alignment_load_id = ? "
+            "WHERE game_id = ? AND event_id = ?",
+            aligned,
         )
-
-    print(f"Wrote {len(events)} events and {len(shots)} shots for game {nhl_game_id} to {DB_PATH}")
+    ops.log.info("game %s: loaded %d events and %d shots", game_id, len(events), len(shots))
 
 
 if __name__ == "__main__":
-    build(int(sys.argv[1]) if len(sys.argv) > 1 else 2025020969)
+    if len(sys.argv) != 2:
+        raise SystemExit(__doc__)
+    ops.setup_logging()
+    build(int(sys.argv[1]))

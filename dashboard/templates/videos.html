@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Videos</h1>
+{% if busy %}<div class="banner info">A run is in progress (see <a href="{{ url_for('index') }}">Overview</a>); actions are off until it finishes.</div>{% endif %}
+{% if cooldown %}<div class="banner info">Scheduled runs are paused from YouTube until {{ cooldown }} after a block. Actions here ignore the pause; if YouTube refuses a video, that video is skipped.</div>{% endif %}
+
+<div class="browser">
+  <nav class="folders" aria-label="Folders">
+    {% for f in folders %}
+    <a href="{{ url_for('videos', folder=f.key, q=q or None) }}" class="{{ 'on' if f.key == folder and not state }}"
+       title="{{ (f.states or ['every state'])|join(', ') }}"><span>{{ f.label }}</span><span class="n">{{ f.count }}</span></a>
+    {% endfor %}
+  </nav>
+
+  <section>
+    <form class="toolbar" method="get" action="{{ url_for('videos') }}">
+      <input type="hidden" name="folder" value="{{ folder }}">
+      {% if state %}<input type="hidden" name="state" value="{{ state }}">{% endif %}
+      <input type="search" name="q" value="{{ q }}" placeholder="Search title, video ID or game ID">
+      <button class="secondary">Search</button>
+    </form>
+    {% if state %}<p class="muted">Showing state <span class="tag {{ state }}">{{ state }}</span> · <a href="{{ url_for('videos') }}">show all</a></p>{% endif %}
+
+    <form method="post" action="{{ url_for('process_videos') }}" id="actions">
+      <input type="hidden" name="back" value="{{ request.full_path }}">
+      <div class="toolbar">
+        <span class="muted" id="picked">0 selected</span>
+        {% for key, label in stages.items() %}
+        <button name="stage" value="{{ key }}" class="{{ '' if key == 'align' else 'secondary' }}" data-needs-pick disabled>{{ label }}</button>
+        {% endfor %}
+      </div>
+      <div class="wrap"><table>
+        <tr><th class="check"><input type="checkbox" id="all" aria-label="Select all"></th>
+            <th>Title</th><th>Game</th><th>Stage</th><th>Files</th><th>Alignment</th></tr>
+        {% for v in rows %}
+        <tr class="pick">
+          <td class="check"><input type="checkbox" name="video_ids" value="{{ v.video_id }}" aria-label="Select {{ v.title or v.video_id }}"></td>
+          <td><a href="{{ url_for('video_page', video_id=v.video_id) }}">{{ v.title or v.video_id }}</a>
+              <div class="muted" style="font-size:12.5px">{{ (v.published_at or "")[:10] }} · <a href="https://www.youtube.com/watch?v={{ v.video_id }}" target="_blank" rel="noopener">YouTube ↗</a></div></td>
+          <td>{% if v.game %}{{ v.game[2] }} @ {{ v.game[3] }}<div class="muted" style="font-size:12.5px">{{ v.game[1] }} · {{ v.game_id }}</div>
+              {% elif v.game_id %}{{ v.game_id }}{% else %}<span class="muted">—</span>{% endif %}</td>
+          <td><span class="tag {{ v.state }}">{{ v.state }}</span>
+              {% if v.last_error and v.state != 'aligned' %}<div class="muted" style="font-size:12px" title="{{ v.last_error }}">{{ v.last_error[:70] }}{% if v.last_error|length > 70 %}…{% endif %}</div>{% endif %}</td>
+          <td class="files">
+            <span class="{{ '' if v.has_captions else 'no' }}">{{ '✓' if v.has_captions else '·' }} captions</span>
+            <span class="{{ '' if v.has_events else 'no' }}">{{ '✓' if v.has_events else '·' }} MoneyPuck</span>
+            {% if v.frames %}<span>{{ v.frames }} frames</span>
+            {% elif v.has_readings and v.state == 'aligned' %}<span class="muted" title="Frame images are deleted once alignment passes; their OCR text is kept">frames cleared</span>
+            {% else %}<span class="no">0 frames</span>{% endif %}</td>
+          <td>{% if v.alignment %}<span class="{{ 'ok' if v.alignment.passed else 'partial' }}">{{ 'passed' if v.alignment.passed else 'not passed' }}</span>
+              <div class="muted" style="font-size:12.5px">{{ v.alignment.pinned_by_clock }}/{{ v.alignment.segments }} segments</div>
+              {% else %}<span class="muted">—</span>{% endif %}</td>
+        </tr>
+        {% else %}<tr><td colspan="6" class="muted">No videos here.</td></tr>{% endfor %}
+      </table></div>
+    </form>
+    <p class="muted">An action takes each selected video through any earlier stage it still needs: “Align” on a video
+      without captions fetches them, loads MoneyPuck data, then aligns. Align always re-runs, so it also retries
+      unverified videos.</p>
+  </section>
+</div>
+
+<script>
+  const boxes = [...document.querySelectorAll('input[name=video_ids]')];
+  const all = document.getElementById('all');
+  const busy = {{ 'true' if busy else 'false' }};
+  function update() {
+    const n = boxes.filter(b => b.checked).length;
+    document.getElementById('picked').textContent = n + ' selected';
+    document.querySelectorAll('[data-needs-pick]').forEach(b => b.disabled = busy || n === 0);
+    all.checked = n > 0 && n === boxes.length;
+    all.indeterminate = n > 0 && n < boxes.length;
+  }
+  all.addEventListener('change', () => { boxes.forEach(b => b.checked = all.checked); update(); });
+  boxes.forEach(b => b.addEventListener('change', update));
+  // clicking anywhere on a row (but a link or the box itself) toggles it
+  document.querySelectorAll('tr.pick').forEach(tr => tr.addEventListener('click', e => {
+    if (e.target.closest('a, input')) return;
+    const b = tr.querySelector('input[name=video_ids]'); b.checked = !b.checked; update();
+  }));
+  update();
+</script>
+{% endblock %}

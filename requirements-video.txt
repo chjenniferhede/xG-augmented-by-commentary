@@ -1,4 +1,0 @@
-rapidocr_onnxruntime
-imageio-ffmpeg
-yt-dlp
-numpy
