@@ -77,13 +77,19 @@ def frame_count(video_id: str) -> int:
     return sum(1 for p in d.iterdir() if p.suffix == ".jpg" and not p.name.startswith("full_")) if d.is_dir() else 0
 
 
+ALIGNMENT_COLUMNS = ("passed", "segments", "pinned_by_clock", "coverage", "clock_reversals", "readings",
+                     "video_cuts", "score_readings", "score_match", "frames_cached", "frames_fetched",
+                     "max_offset_drop", "created_at")
+
+
 def alignment_details(w, video_id=None) -> dict:
-    """video_id -> metrics of its latest alignment."""
+    """video_id -> its alignment in effect (videos.alignment_id), as a dict of the metrics."""
     if w is None:
         return {}
-    sql = "SELECT video_id, details FROM loads WHERE kind = 'alignment' {} ORDER BY loaded_at"
-    rows = w.execute(sql.format("AND video_id = ?"), (video_id,)) if video_id else w.execute(sql.format(""))
-    return {vid: json.loads(d) for vid, d in rows if d}
+    sql = (f"SELECT v.video_id, {', '.join('a.' + c for c in ALIGNMENT_COLUMNS)} FROM videos v "
+           "JOIN alignments a ON a.alignment_id = v.alignment_id {}")
+    rows = w.execute(sql.format("WHERE v.video_id = ?"), (video_id,)) if video_id else w.execute(sql.format(""))
+    return {r[0]: dict(zip(ALIGNMENT_COLUMNS, r[1:])) for r in rows}
 
 
 def youtube_usage() -> list:
@@ -112,11 +118,13 @@ def index():
     w = warehouse()
     if w is not None:
         totals = {
-            "games": w.execute("SELECT COUNT(*) FROM games").fetchone()[0],
-            "with_events": w.execute("SELECT COUNT(DISTINCT game_id) FROM events").fetchone()[0],
-            "aligned": w.execute("SELECT COUNT(DISTINCT game_id) FROM events "
-                                 "WHERE alignment_load_id IS NOT NULL").fetchone()[0],
+            "videos": w.execute("SELECT COUNT(*) FROM videos").fetchone()[0],
+            "with_events": w.execute("SELECT COUNT(*) FROM games WHERE events_load_id IS NOT NULL").fetchone()[0],
+            "aligned": w.execute("SELECT COUNT(*) FROM videos v JOIN alignments a ON a.alignment_id = v.alignment_id "
+                                 "WHERE a.passed").fetchone()[0],
             "shots": w.execute("SELECT COUNT(*) FROM shots").fetchone()[0],
+            # shots placed in a video whose alignment passed (the rows of shot_commentary)
+            "aligned_shots": w.execute("SELECT COUNT(*) FROM shot_commentary").fetchone()[0],
         }
     return render_template(
         "index.html", runs=runs, queue=queue, usage=youtube_usage(), running=pipeline.is_running(),
@@ -209,10 +217,10 @@ def video_page(video_id: str):
         game = w.execute("SELECT game_id, game_date, away_name, home_name, away_goals, home_goals, ended_in, "
                          "game_type, venue FROM games WHERE game_id = ?", (v["game_id"],)).fetchone()
         counts = {
-            "transcript lines": w.execute("SELECT COUNT(*) FROM transcript WHERE video_id = ?", (video_id,)).fetchone()[0],
+            "caption lines": w.execute("SELECT COUNT(*) FROM captions WHERE video_id = ?", (video_id,)).fetchone()[0],
             "events": w.execute("SELECT COUNT(*) FROM events WHERE game_id = ?", (v["game_id"],)).fetchone()[0],
             "events placed in the video": w.execute(
-                "SELECT COUNT(*) FROM events WHERE game_id = ? AND calibrated_transcript_time IS NOT NULL",
+                "SELECT COUNT(*) FROM events WHERE game_id = ? AND video_sec IS NOT NULL",
                 (v["game_id"],)).fetchone()[0],
             "shots": w.execute("SELECT COUNT(*) FROM shots WHERE game_id = ?", (v["game_id"],)).fetchone()[0],
         }

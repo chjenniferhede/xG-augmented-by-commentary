@@ -29,7 +29,26 @@ MIGRATIONS = Path(__file__).resolve().parent / "migrations"
 DATABASES = {"warehouse": paths.WAREHOUSE_DB, "ops": paths.OPS_DB}
 DATABASE_URL = os.environ.get("DATABASE_URL") or None  # empty = SQLite
 
-_local = threading.local()  # one connection per database per thread
+class _ThreadConnections(dict):
+    """A thread's connections, closed when the thread ends: a worker thread's thread-local data is
+    freed as it exits, so its connections don't stay open until garbage collection (the database
+    login has a connection limit)."""
+
+    def __del__(self):
+        for con in self.values():
+            try:
+                con.close()
+            except Exception:
+                pass
+
+
+_local = threading.local()  # .conns: one connection per database per thread
+
+
+def _conns() -> _ThreadConnections:
+    if not hasattr(_local, "conns"):
+        _local.conns = _ThreadConnections()
+    return _local.conns
 
 
 def is_postgres() -> bool:
@@ -158,12 +177,12 @@ class PgConnection:
 
 def connect(name: str):
     """The calling thread's connection to a database (warehouse or ops), migrated to the latest version."""
-    con = getattr(_local, name, None)
-    if con is not None:
-        return con
+    conns = _conns()
+    if name in conns:
+        return conns[name]
     con = open_connection(name)
     migrate(con, name)
-    setattr(_local, name, con)
+    conns[name] = con
     return con
 
 
@@ -181,24 +200,23 @@ def open_connection(name: str):
 
 def close_thread_connections() -> None:
     """Close this thread's connections (the dashboard does this after each request)."""
-    for name in DATABASES:
-        con = getattr(_local, name, None)
-        if con is not None:
-            setattr(_local, name, None)
-            try:
-                con.close()
-            except Exception:
-                pass
+    conns = _conns()
+    for con in conns.values():
+        try:
+            con.close()
+        except Exception:
+            pass
+    conns.clear()
 
 
-def table_columns(con, table: str) -> list:
-    """Column names in table order. Postgres folds unquoted names to lowercase."""
+def column_types(con, table: str) -> dict:
+    """{column: type name, lowercase} in table order (the SQLite migrations use the same type names)."""
     if isinstance(con, PgConnection):
-        rows = con.execute("SELECT column_name FROM information_schema.columns "
+        rows = con.execute("SELECT column_name, data_type FROM information_schema.columns "
                            "WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
-                           (con.schema, table.lower())).fetchall()
-        return [r[0] for r in rows]
-    return [row[1] for row in con.execute(f"PRAGMA table_info({table})")]
+                           (con.schema, table)).fetchall()
+        return {name: typ.lower() for name, typ in rows}
+    return {row[1]: row[2].lower() for row in con.execute(f"PRAGMA table_info({table})")}
 
 
 def reset(name: str) -> None:
@@ -234,9 +252,14 @@ def code_version() -> str:
         return "unknown"
 
 
-def new_load(con, kind: str, *, game_id=None, video_id=None, raw_files=(), source_urls=(),
-             details=None) -> str:
-    """Record one batch of loaded data and return its load_id."""
+def file_records(raw_files) -> str:
+    """JSON list of {path (under data/), sha256} for the raw files a batch was made from."""
+    files = [Path(p) for p in raw_files if p]
+    return json.dumps([{"path": str(p.relative_to(paths.DATA)), "sha256": raw_store.sha256(p)} for p in files])
+
+
+def new_load(con, kind: str, *, game_id=None, video_id=None, raw_files=(), source_urls=()) -> str:
+    """Record one batch of loaded data (kind: games, events, shots or captions); returns its load_id."""
     import ops  # late import: ops imports db
 
     files = [Path(p) for p in raw_files if p]
@@ -244,13 +267,11 @@ def new_load(con, kind: str, *, game_id=None, video_id=None, raw_files=(), sourc
     load_id = uuid.uuid4().hex
     con.execute(
         "INSERT INTO loads (load_id, kind, game_id, video_id, raw_files, source_urls, fetched_at, "
-        "loaded_at, code_version, run_id, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "loaded_at, code_version, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            load_id, kind, game_id, video_id,
-            json.dumps([{"path": str(p.relative_to(paths.DATA)), "sha256": raw_store.sha256(p)} for p in files]),
-            json.dumps(list(source_urls)),
+            load_id, kind, game_id, video_id, file_records(files), json.dumps(list(source_urls)),
             datetime.fromtimestamp(fetched, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if fetched else None,
-            now_iso(), code_version(), ops.current_run_id, json.dumps(details) if details else None,
+            now_iso(), code_version(), ops.current_run_id,
         ),
     )
     return load_id

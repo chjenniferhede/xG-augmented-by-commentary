@@ -18,12 +18,13 @@ A quality check runs before results are written: enough segments pinned by the c
 time read in video order that (almost) never runs backwards (cuts in the replay skip it forward,
 a misread digit usually doesn't), and (where the scoreboard's score can be read) a score that
 matches MoneyPuck.
-The metrics are saved on the alignment's row in `loads`.
 
 Writes to the warehouse:
-    events.calibrated_transcript_time   when each event happens in the video
-    transcript.calibrated_game_time     game time when each caption was spoken
-    transcript.in_play                  1 = clock running; 0 = stoppage/replay (frozen clock)
+    alignments          one row per run: the quality metrics, and passed (trust the times below)
+    videos.alignment_id the alignment in effect
+    events.video_sec    when each event happens in the video
+    captions.game_sec   game time when each caption was spoken
+    captions.live       true = clock running; false = stoppage/replay (frozen clock)
 
 Usage: python scripts/align_video.py <youtube_video_id> [--workers N]
 """
@@ -59,6 +60,9 @@ FRAME_WORKERS = int(os.environ.get("XG_ALIGN_WORKERS", "1"))  # parallel frame f
 # the median per segment absorbs an occasional one.
 GATE = {"min_coverage": 0.9, "max_reversals": 0.01, "min_score_match": 0.9, "min_score_readings": 10}
 TEAM_ALIASES = {"SJS": ["SJ"], "TBL": ["TB"], "NJD": ["NJ"], "LAK": ["LA"], "VGK": ["VEG", "VGK"]}
+# quality() metrics, stored as columns of the alignments table
+METRIC_COLUMNS = ("passed", "segments", "pinned_by_clock", "coverage", "clock_reversals", "readings",
+                  "video_cuts", "score_readings", "score_match", "frames_cached", "frames_fetched")
 
 _local = threading.local()
 
@@ -410,7 +414,9 @@ class Scoreboard:
         return {**r, "period": label, "clock": clock, "g": g}
 
     def read_many(self, vs):
-        if self.workers <= 1:
+        # Already in a worker (segments searched in parallel): read in turn, not a pool in a pool,
+        # which multiplied threads and their database connections past the login's limit.
+        if self.workers <= 1 or threading.current_thread() is not threading.main_thread():
             return [self.read(v) for v in vs]
         with ThreadPoolExecutor(self.workers) as ex:
             return list(ex.map(self.read, vs))
@@ -547,7 +553,8 @@ def quality(bug: Scoreboard, seg_rows, goals, away: str, home: str) -> dict:
             "frames_cached": len(bug.cache), "frames_fetched": bug.new_frames}
 
 
-def calibrated_transcript_times(events, seg_rows):
+def event_video_times(events, seg_rows):
+    """-> [(event_id, video_sec or None, segment)]"""
     out = []
     for eid, t, ev in events:
         # An event at a segment boundary belongs to the segment it happens in: faceoffs and
@@ -560,22 +567,23 @@ def calibrated_transcript_times(events, seg_rows):
     return out
 
 
-def calibrated_game_times(transcript, seg_rows):
+def caption_game_times(captions, seg_rows):
+    """-> [(seq, game_sec, live)]: live when spoken while the clock ran."""
     out = []
-    for seq, start in transcript:
-        game_sec, in_play = None, 0
+    for seq, start in captions:
+        game_sec, live = None, False
         for k, a, b, offset, _, _ in seg_rows:
             if offset is None:
                 continue
             if a + offset <= start <= b + offset:
-                game_sec, in_play = start - offset, 1
+                game_sec, live = start - offset, True
                 break
             if start < a + offset:
                 game_sec = a  # stoppage before this segment: clock frozen at its faceoff time
                 break
         else:
             game_sec = seg_rows[-1][2]
-        out.append((seq, game_sec, in_play))
+        out.append((seq, game_sec, live))
     return out
 
 
@@ -598,7 +606,8 @@ def main(video_id: str, workers: int = FRAME_WORKERS) -> dict:
     """Align one video; returns the quality metrics (metrics['passed'] says if it's trusted)."""
     con = db.connect("warehouse")
     row = con.execute(
-        "SELECT g.game_id, g.game_type, g.away_team, g.home_team FROM games g WHERE g.video_id = ?",
+        "SELECT g.game_id, g.game_type, g.away_team, g.home_team FROM videos v JOIN games g USING (game_id) "
+        "WHERE v.video_id = ?",
         (video_id,),
     ).fetchone()
     if row is None:
@@ -610,11 +619,11 @@ def main(video_id: str, workers: int = FRAME_WORKERS) -> dict:
     if not events:
         raise RuntimeError(f"No events for game {game_id}; run build_db.py first.")
     goals = con.execute(
-        "SELECT time, awayTeamGoals, homeTeamGoals FROM events WHERE game_id = ? AND event = 'GOAL' "
+        "SELECT time, away_team_goals, home_team_goals FROM events WHERE game_id = ? AND event = 'GOAL' "
         "ORDER BY event_id", (game_id,),
     ).fetchall()
-    transcript = con.execute(
-        "SELECT seq, start_sec FROM transcript WHERE video_id = ? ORDER BY seq", (video_id,)
+    captions = con.execute(
+        "SELECT seq, start_sec FROM captions WHERE video_id = ? ORDER BY seq", (video_id,)
     ).fetchall()
 
     bug = Scoreboard(video_id, playoff=game_type == "playoff", workers=workers)
@@ -623,18 +632,21 @@ def main(video_id: str, workers: int = FRAME_WORKERS) -> dict:
     metrics = quality(bug, seg_rows, goals, away, home)
 
     with con:
-        load_id = db.new_load(con, "alignment", game_id=game_id, video_id=video_id,
-                              raw_files=[bug.index_path],
-                              source_urls=[f"https://www.youtube.com/watch?v={video_id}"], details=metrics)
+        alignment_id = con.execute(
+            f"INSERT INTO alignments (video_id, created_at, raw_files, code_version, run_id, {', '.join(METRIC_COLUMNS)}) "
+            f"VALUES (?, ?, ?, ?, ?, {', '.join('?' * len(METRIC_COLUMNS))}) RETURNING alignment_id",
+            (video_id, db.now_iso(), db.file_records([bug.index_path]), db.code_version(), ops.current_run_id,
+             *(metrics[c] for c in METRIC_COLUMNS)),
+        ).fetchone()[0]
         con.executemany(
-            "UPDATE events SET calibrated_transcript_time = ?, alignment_load_id = ? WHERE game_id = ? AND event_id = ?",
-            [(v, load_id, game_id, eid) for eid, v, _ in calibrated_transcript_times(events, seg_rows)],
+            "UPDATE events SET video_sec = ? WHERE game_id = ? AND event_id = ?",
+            [(v, game_id, eid) for eid, v, _ in event_video_times(events, seg_rows)],
         )
         con.executemany(
-            "UPDATE transcript SET calibrated_game_time = ?, in_play = ?, alignment_load_id = ? "
-            "WHERE video_id = ? AND seq = ?",
-            [(g, in_play, load_id, video_id, seq) for seq, g, in_play in calibrated_game_times(transcript, seg_rows)],
+            "UPDATE captions SET game_sec = ?, live = ? WHERE video_id = ? AND seq = ?",
+            [(g, live, video_id, seq) for seq, g, live in caption_game_times(captions, seg_rows)],
         )
+        con.execute("UPDATE videos SET alignment_id = ? WHERE video_id = ?", (alignment_id, video_id))
     ops.log.info("video %s: %d/%d segments pinned by clock, %d frames (%d fetched); quality %s",
                  video_id, metrics["pinned_by_clock"], metrics["segments"], metrics["frames_cached"],
                  metrics["frames_fetched"], "passed" if metrics["passed"] else "NOT passed")

@@ -1,4 +1,4 @@
-"""Load a YouTube game replay's transcript into the warehouse.
+"""Load a YouTube game replay's captions into the warehouse (tables videos and captions).
 
 Give it the video's link (or ID). It downloads the captions once and keeps them in
 data/raw/youtube/captions/<video_id>.json; later runs read that file and do not contact YouTube.
@@ -8,7 +8,7 @@ using the NHL's public schedule API, and saved with the captions. Pass --game-id
 yourself, or when the title is ambiguous (the script lists the candidates).
 
 Timestamps are seconds into the video, not game clock. Run scripts/align_video.py
-afterwards to fill calibrated_game_time / in_play (a reload keeps them).
+afterwards to fill captions.game_sec / live (a reload keeps them, unless the game changed).
 
 Usage: python scripts/load_transcript.py <youtube link or id> [--game-id NHL_GAME_ID]
 """
@@ -198,35 +198,39 @@ def load(video_id: str, nhl_game_id: int) -> None:
 
     con = db.connect("warehouse")
     with con:
-        # a video re-pinned to another game: unlink it from the old one
-        con.execute("UPDATE games SET video_id = NULL, video_title = NULL WHERE video_id = ? AND game_id != ?",
-                    (video_id, nhl_game_id))
-        upsert_game(con, nhl_game_id, video_id=video_id, video_title=data["title"])
-        # Replace any previous load of this video, keeping its alignment: calibrated times
-        # depend only on the video, which has not changed.
+        other = con.execute("SELECT video_id FROM videos WHERE game_id = ? AND video_id <> ?",
+                            (nhl_game_id, video_id)).fetchone()
+        if other:
+            raise RuntimeError(f"game {nhl_game_id} already has video {other[0]} (one video per game)")
+        upsert_game(con, nhl_game_id)
+        # Replace any previous load of this video's captions. Its alignment depends only on the
+        # video, so it is kept, unless the video now belongs to another game.
+        row = con.execute("SELECT game_id FROM videos WHERE video_id = ?", (video_id,)).fetchone()
+        same_game = row is not None and row[0] == nhl_game_id
         aligned = con.execute(
-            "SELECT calibrated_game_time, in_play, alignment_load_id, video_id, seq FROM transcript "
-            "WHERE video_id = ? AND alignment_load_id IS NOT NULL",
+            "SELECT game_sec, live, video_id, seq FROM captions WHERE video_id = ? AND game_sec IS NOT NULL",
             (video_id,),
-        ).fetchall()
-        con.execute("DELETE FROM transcript WHERE video_id = ?", (video_id,))
-        load_id = db.new_load(con, "transcript", game_id=nhl_game_id, video_id=video_id,
+        ).fetchall() if same_game else []
+        con.execute("DELETE FROM captions WHERE video_id = ?", (video_id,))
+        load_id = db.new_load(con, "captions", game_id=nhl_game_id, video_id=video_id,
                               raw_files=[captions_path(video_id)], source_urls=[data["url"]])
-        con.executemany(
-            "INSERT INTO transcript (video_id, game_id, seq, start_sec, duration_sec, end_sec, text, load_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (video_id, nhl_game_id, i, s["start"], s["duration"], s["start"] + s["duration"],
-                 clean(s["text"]), load_id)
-                for i, s in enumerate(snippets, start=1)
-            ],
+        con.execute(
+            """
+            INSERT INTO videos (video_id, game_id, title, captions_load_id) VALUES (?, ?, ?, ?)
+            ON CONFLICT (video_id) DO UPDATE SET
+                title = excluded.title, captions_load_id = excluded.captions_load_id,
+                alignment_id = CASE WHEN videos.game_id = excluded.game_id THEN videos.alignment_id END,
+                game_id = excluded.game_id
+            """,
+            (video_id, nhl_game_id, data["title"], load_id),
         )
         con.executemany(
-            "UPDATE transcript SET calibrated_game_time = ?, in_play = ?, alignment_load_id = ? "
-            "WHERE video_id = ? AND seq = ?",
-            aligned,
+            "INSERT INTO captions (video_id, seq, start_sec, end_sec, text) VALUES (?, ?, ?, ?, ?)",
+            [(video_id, i, s["start"], s["start"] + s["duration"], clean(s["text"]))
+             for i, s in enumerate(snippets, start=1)],
         )
-    ops.log.info("video %s (game %s): loaded %d transcript lines", video_id, nhl_game_id, len(snippets))
+        con.executemany("UPDATE captions SET game_sec = ?, live = ? WHERE video_id = ? AND seq = ?", aligned)
+    ops.log.info("video %s (game %s): loaded %d caption lines", video_id, nhl_game_id, len(snippets))
 
 
 def main() -> None:

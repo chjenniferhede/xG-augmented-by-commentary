@@ -15,10 +15,11 @@
 
 <h2>Database Data</h2>
 <div class="cards">
-  <div class="card"><b>{{ warehouse.games or 0 }}</b>game captions</div>
-  <div class="card"><b>{{ warehouse.with_events or 0 }}</b>with moneypuck events</div>
-  <div class="card"><b>{{ warehouse.aligned or 0 }}</b>aligned to video</div>
+  <div class="card"><b>{{ warehouse.videos or 0 }}</b>videos with captions</div>
+  <div class="card"><b>{{ warehouse.with_events or 0 }}</b>games with MoneyPuck data</div>
+  <div class="card"><b>{{ warehouse.aligned or 0 }}</b>aligned (passed)</div>
   <div class="card"><b>{{ warehouse.shots or 0 }}</b>shots</div>
+  <div class="card"><b>{{ warehouse.aligned_shots or 0 }}</b>shots aligned (passed)</div>
 </div>
 
 <h2>Queue</h2>

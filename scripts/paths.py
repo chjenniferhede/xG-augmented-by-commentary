@@ -9,8 +9,8 @@ also read from the repo's .env file.
       nhl/                        boxscores, schedule responses
       youtube/captions/           <video_id>.json: caption track + video metadata
       youtube/frames/<video_id>/  scoreboard crops + index.json (OCR readings)
-    db/moneypuck.sqlite           the warehouse: games, events, shots, transcript, loads
-    db/pipeline.sqlite            operations: runs, steps, requests, videos queue
+    db/moneypuck.sqlite           the warehouse, when DATABASE_URL is unset (else Postgres schema warehouse)
+    db/pipeline.sqlite            operations, when DATABASE_URL is unset (else Postgres schema ops)
     logs/                         one log file per pipeline run
 """
 import os

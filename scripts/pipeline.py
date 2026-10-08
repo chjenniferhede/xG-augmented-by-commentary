@@ -26,7 +26,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import db
 import ops
@@ -141,7 +141,8 @@ def game_is_old(game_id: int) -> bool:
     row = db.connect("warehouse").execute("SELECT game_date FROM games WHERE game_id = ?", (game_id,)).fetchone()
     if not row:
         return False
-    return datetime.strptime(row[0], "%Y-%m-%d").replace(tzinfo=timezone.utc) < datetime.now(timezone.utc) - timedelta(days=60)
+    played = row[0] if isinstance(row[0], date) else date.fromisoformat(row[0])  # Postgres: date; SQLite: text
+    return played < datetime.now(timezone.utc).date() - timedelta(days=60)
 
 
 def do_game_data(v: dict, summary: dict) -> bool:

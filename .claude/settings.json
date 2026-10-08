@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(../.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python scripts/pipeline.py process captions 0AMIEzrA28M --trigger cli)",
+      "Bash(.venv/bin/python -m unittest discover tests)",
+      "Bash(python3 -c \"import sqlite3; print\\(sqlite3.sqlite_version\\)\")",
+      "Bash(.venv/bin/python -c \"import sqlite3; print\\(sqlite3.sqlite_version\\)\")",
+      "Bash(git add *)",
+      "Bash(DATABASE_URL= ../.venv/bin/python -)"
+    ]
+  }
+}

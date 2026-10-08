@@ -52,12 +52,13 @@
 <dl class="kv">
   <dt>Result</dt><dd class="{{ 'ok' if alignment.passed else 'partial' }}">{{ 'passed' if alignment.passed else 'not passed' }}</dd>
   <dt>Segments pinned by the clock</dt><dd>{{ alignment.pinned_by_clock }} / {{ alignment.segments }} ({{ '%.0f'|format(alignment.coverage * 100) }}%, needs 90%)</dd>
-  {% if alignment.clock_reversals is defined %}
+  {% if alignment.clock_reversals is not none %}
   <dt>Clock read going backwards</dt><dd>{{ alignment.clock_reversals }} of {{ alignment.readings }} readings (needs ≤ 1%)</dd>
   {% else %}
   <dt>Largest offset drop</dt><dd>{{ alignment.max_offset_drop }} s <span class="muted">(older check)</span></dd>
   {% endif %}
-  {% if alignment.video_cuts is defined %}<dt>Cuts in the video</dt><dd>{{ alignment.video_cuts }}</dd>{% endif %}
+  {% if alignment.video_cuts is not none %}<dt>Cuts in the video</dt><dd>{{ alignment.video_cuts }}</dd>{% endif %}
+  <dt>Aligned</dt><dd>{{ alignment.created_at }}</dd>
   <dt>Score matches MoneyPuck</dt><dd>{% if alignment.score_match is not none %}{{ '%.0f'|format(alignment.score_match * 100) }}% of {{ alignment.score_readings }} readings{% else %}no readable score{% endif %}</dd>
   <dt>Frames</dt><dd>{{ alignment.frames_cached }} read, {{ alignment.frames_fetched }} fetched in that run</dd>
 </dl>

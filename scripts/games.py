@@ -1,7 +1,7 @@
 """The games table: one row per NHL game, from the NHL's public game API.
 
 Shared by build_db.py and load_transcript.py, so a game gets a row as soon as either its
-MoneyPuck data or its transcript is loaded. The raw boxscore is kept in
+MoneyPuck data or its video's captions are loaded. The raw boxscore is kept in
 data/raw/nhl/boxscore/<game_id>.json and re-fetched only while the game isn't final.
 """
 import requests
@@ -68,27 +68,25 @@ def summarize(box: dict) -> dict:
     }
 
 
-def upsert_game(con, game_id: int, video_id: str = None, video_title: str = None) -> None:
-    """Insert or refresh a game's row. Video columns are only overwritten when given."""
+def upsert_game(con, game_id: int) -> None:
+    """Insert or refresh a game's row from its boxscore. The MoneyPuck load columns are left alone."""
     g = summarize(fetch_boxscore(game_id))
-    load_id = db.new_load(con, "games", game_id=game_id, video_id=video_id,
-                          raw_files=[boxscore_path(game_id)],
+    load_id = db.new_load(con, "games", game_id=game_id, raw_files=[boxscore_path(game_id)],
                           source_urls=[f"{NHL_API}/gamecenter/{game_id}/boxscore"])
     con.execute(
         """
-        INSERT INTO games VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO games (game_id, season, game_type, game_date, venue, away_team, home_team,
+                           away_name, home_name, away_goals, home_goals, ended_in, load_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (game_id) DO UPDATE SET
             season = excluded.season, game_type = excluded.game_type,
             game_date = excluded.game_date, venue = excluded.venue,
             away_team = excluded.away_team, home_team = excluded.home_team,
             away_name = excluded.away_name, home_name = excluded.home_name,
             away_goals = excluded.away_goals, home_goals = excluded.home_goals,
-            ended_in = excluded.ended_in,
-            video_id = COALESCE(excluded.video_id, games.video_id),
-            video_title = COALESCE(excluded.video_title, games.video_title),
-            load_id = excluded.load_id
+            ended_in = excluded.ended_in, load_id = excluded.load_id
         """,
         (game_id, g["season"], g["game_type"], g["game_date"], g["venue"],
          g["away"]["abbrev"], g["home"]["abbrev"], g["away"]["name"], g["home"]["name"],
-         g["away"]["goals"], g["home"]["goals"], g["ended_in"], video_id, video_title, load_id),
+         g["away"]["goals"], g["home"]["goals"], g["ended_in"], load_id),
     )

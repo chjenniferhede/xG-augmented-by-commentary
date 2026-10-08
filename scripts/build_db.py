@@ -10,6 +10,7 @@ so it is re-downloaded (overwritten) when the game isn't in it and the copy is o
 Usage: python scripts/build_db.py <nhl_game_id>
 """
 import io
+import re
 import sys
 import time
 import zipfile
@@ -30,6 +31,19 @@ SHOTS_REFRESH_AFTER = 86400  # seconds
 
 class GameDataMissing(Exception):
     """MoneyPuck has no data for this game (yet)."""
+
+
+def snake(name: str) -> str:
+    """MoneyPuck's camelCase column name -> the warehouse's snake_case one.
+
+    'homeTeamExpectedGoalsEVNonRebound' -> 'home_team_expected_goals_ev_non_rebound',
+    'lastEventxCord_adjusted' -> 'last_event_x_cord_adjusted', 'xGoal' -> 'x_goal'.
+    Migration 0002 was generated with this function, so the two always agree.
+    """
+    s = re.sub(r"([a-z])([xy])(Cord)", r"\1_\2\3", name)   # 'lastEventxCord': x starts a word
+    s = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", s)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+    return re.sub(r"_+", "_", s).lower()
 
 
 def download(url: str, path) -> None:
@@ -87,24 +101,27 @@ def load_shots(game_id: int) -> pd.DataFrame:
     return pd.concat([pd.Series(game_id, index=shots.index, name="game_id"), shots], axis=1)
 
 
-def insert_frame(con, table: str, df: pd.DataFrame, load_id: str) -> None:
-    """Insert only the columns the schema defines; report any MoneyPuck adds."""
-    columns = [c for c in db.table_columns(con, table)
-               if c not in ("load_id", "calibrated_transcript_time", "alignment_load_id")]
-    # Postgres stores MoneyPuck's camelCase names in lowercase: match names ignoring case.
-    df = df.rename(columns={c: c.lower() for c in df.columns}) if columns == [c.lower() for c in columns] else df
-    extra = sorted(set(df.columns) - set(columns))
+def insert_frame(con, table: str, df: pd.DataFrame) -> None:
+    """Insert a MoneyPuck table: every column the schema defines (MoneyPuck's names in snake_case);
+    report any column MoneyPuck adds that the schema doesn't have yet."""
+    types = {c: t for c, t in db.column_types(con, table).items() if c != "video_sec"}
+    df = df.rename(columns={c: snake(c) for c in df.columns})
+    extra = sorted(set(df.columns) - set(types))
     if extra:
         ops.log.info("%s: ignoring %d columns not in the schema: %s", table, len(extra), ", ".join(extra[:10]))
-    df = df.reindex(columns=columns)
-    # Plain Python values (neither driver binds numpy scalars); NaN becomes NULL; True/False
-    # become 1/0 (the flag columns are integers, and Postgres won't take a boolean there).
-    values = [[None if pd.isna(v) else int(v) if isinstance(v, bool) else v for v in df[c].tolist()]
-              for c in columns]
-    cols = columns + ["load_id"]
+    df = df.reindex(columns=list(types))
+
+    # Plain Python values (neither driver binds numpy scalars); NaN becomes NULL; MoneyPuck's 0/1
+    # flags become True/False for the boolean columns.
+    def value(v, typ):
+        if pd.isna(v):
+            return None
+        return bool(v) if typ == "boolean" else v
+
+    values = [[value(v, t) for v in df[c].tolist()] for c, t in types.items()]
     con.executemany(
-        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
-        [(*row, load_id) for row in zip(*values)],
+        f"INSERT INTO {table} ({', '.join(types)}) VALUES ({', '.join('?' * len(types))})",
+        list(zip(*values)),
     )
 
 
@@ -117,23 +134,22 @@ def build(game_id: int) -> None:
     with con:
         # Reloading keeps the events' alignment to the video (it depends only on the video).
         aligned = con.execute(
-            "SELECT calibrated_transcript_time, alignment_load_id, game_id, event_id FROM events "
-            "WHERE game_id = ? AND alignment_load_id IS NOT NULL",
+            "SELECT video_sec, game_id, event_id FROM events WHERE game_id = ? AND video_sec IS NOT NULL",
             (game_id,),
         ).fetchall()
+        con.execute("DELETE FROM shots WHERE game_id = ?", (game_id,))  # shots reference events
         con.execute("DELETE FROM events WHERE game_id = ?", (game_id,))
-        con.execute("DELETE FROM shots WHERE game_id = ?", (game_id,))
 
         upsert_game(con, game_id)
-        insert_frame(con, "events", events,
-                     db.new_load(con, "events", game_id=game_id, raw_files=[events_path], source_urls=[events_url]))
-        insert_frame(con, "shots", shots,
-                     db.new_load(con, "shots", game_id=game_id, raw_files=[shots_path], source_urls=[shots_url]))
-        con.executemany(
-            "UPDATE events SET calibrated_transcript_time = ?, alignment_load_id = ? "
-            "WHERE game_id = ? AND event_id = ?",
-            aligned,
+        insert_frame(con, "events", events)
+        insert_frame(con, "shots", shots)
+        con.execute(
+            "UPDATE games SET events_load_id = ?, shots_load_id = ? WHERE game_id = ?",
+            (db.new_load(con, "events", game_id=game_id, raw_files=[events_path], source_urls=[events_url]),
+             db.new_load(con, "shots", game_id=game_id, raw_files=[shots_path], source_urls=[shots_url]),
+             game_id),
         )
+        con.executemany("UPDATE events SET video_sec = ? WHERE game_id = ? AND event_id = ?", aligned)
     ops.log.info("game %s: loaded %d events and %d shots", game_id, len(events), len(shots))
 
 

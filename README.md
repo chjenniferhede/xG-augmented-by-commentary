@@ -35,49 +35,67 @@ the database (the project shares it with another app). Neither schema is exposed
 Supabase's Data API, and row level security is on.
 
 Without `DATABASE_URL`, the same tables are SQLite files in `data/db/`. The tests always use
-SQLite. `scripts/db/copy_sqlite_to_postgres.py` copied the SQLite data into Postgres for the move.
+SQLite.
 
 Raw files stay on the machine that runs the pipeline: `data/raw/` is the source of truth, and
 `pipeline.py rebuild` re-creates the warehouse from it.
 
 ### Warehouse
 
-| Table | Contents |
-|---|---|
-| `games` | One row per game: season, regular season or playoff, date, venue, teams, final score, how it ended (`REG`, `OT`, `SO`), and the replay's `video_id` and title |
-| `events` | Every game event (faceoffs, hits, shots, goals, whistles, penalties) from MoneyPuck, plus `calibrated_transcript_time` |
-| `shots` | Shot attempts (shots on goal, misses, goals): location, shot type, game situation and MoneyPuck's xG (`xGoal`). Joins to `events` on `(game_id, event_id)` |
-| `transcript` | Caption lines from the replay (`start_sec`, `end_sec`, `text`), plus `calibrated_game_time` and `in_play` |
-| `loads` | Provenance: one row per batch of loaded data, with its source URLs, raw files and their SHA-256 hashes, code version (git commit) and pipeline run. Every row in the tables above has a `load_id` (the alignment columns have `alignment_load_id`); alignment loads also store quality metrics in `details` |
-| `timeline` (view) | Events and caption lines on one timeline per game, sorted by transcript time |
-| `shot_commentary` (view) | Each shot with its xG, a video link and the commentary around it |
+```
+games ─┬─< events ──1:1── shots          joined on (game_id, event_id)
+       └── videos ─┬─< captions          one video per game
+                   └─< alignments        videos.alignment_id = the alignment in effect
+loads  provenance, referenced from games (boxscore, events, shots) and videos (captions)
+```
+
+| Table | Key | Contents |
+|---|---|---|
+| `games` | `game_id` | One row per game: season, `game_type` (`regular`, `playoff`, `preseason`), `game_date`, venue, teams, final score, `ended_in` (`REG`, `OT`, `SO`), and which loads supplied its boxscore, events and shots |
+| `videos` | `video_id` | The game's full replay on YouTube: title, `url`, the captions load, and `alignment_id` (the alignment in effect) |
+| `events` | `(game_id, event_id)` | MoneyPuck's play-by-play: every event (faceoffs, hits, shots, goals, whistles, penalties) with all of MoneyPuck's columns in snake_case, plus `video_sec` |
+| `shots` | `(game_id, event_id)` | MoneyPuck's shot dataset: every shot attempt with all its columns, including xG (`x_goal`), shooter, goalie and situation. A separate MoneyPuck file from `events`; shared columns can differ slightly |
+| `captions` | `(video_id, seq)` | Caption lines (`start_sec`, `end_sec`, `text`), plus `game_sec` and `live` once aligned |
+| `alignments` | `alignment_id` | Each alignment of a video to game time and its quality check: `passed`, `coverage`, `clock_reversals`, `score_match`, `video_cuts`, frame counts |
+| `loads` | `load_id` | Provenance: one row per batch of loaded data, with its source URLs, raw files and their SHA-256 hashes, code version (git commit) and pipeline run |
+| `timeline` (view) | | Events and caption lines on one timeline per game, in video order |
+| `shot_commentary` (view) | | Each shot in a video whose alignment passed, with its xG, a video link and the commentary around it |
+
+MoneyPuck's column names are converted to snake_case (`xGoal` → `x_goal`,
+`homeTeamExpectedGoalsEV` → `home_team_expected_goals_ev`) by `build_db.snake()`. Flags such
+as `goal` or `shot_rush` are booleans.
 
 Time columns:
 
 - `events.time`: game seconds elapsed (the clock runs 20:00 → 0:00 in each period; overtime
   follows, 5 minutes in the regular season and 20 in the playoffs).
-- `events.calibrated_transcript_time`: when the event happens in the video, on the same
-  timeline as `transcript.start_sec`.
-- `transcript.calibrated_game_time`: game time when the line was spoken.
-- `transcript.in_play`: `1` if the line was spoken while the clock was running, `0` during a
+- `events.video_sec`: when the event happens in the video, on the same timeline as
+  `captions.start_sec`.
+- `captions.game_sec`: game time when the line was spoken.
+- `captions.live`: true if the line was spoken while the clock was running, false during a
   stoppage (whistle, goal celebration, replay). During a stoppage the game time is the frozen
   clock, and the commentary is often about a play that already happened.
+
+Only trust the times of a video whose alignment passed (`alignments.passed`, via
+`videos.alignment_id`); `shot_commentary` already filters on it.
 
 `shot_commentary` lists each shot with its period clock, shooter, result, shot type, distance,
 xG, the video time, a link that starts 5 s before the shot (so the build-up is included), and
 the caption lines overlapping 4 s before to 10 s after it.
 
-Example: every shot with the commentary spoken around it.
+Example: every shot in a trusted video with the commentary spoken around it.
 
 ```sql
-SELECT s.shooterName, s.event, ROUND(CAST(s.xGoal AS NUMERIC), 3) AS xg, t.in_play, t.text
+SELECT s.shooter_name, s.event, ROUND(CAST(s.x_goal AS NUMERIC), 3) AS xg, c.live, c.text
 FROM shots s
 JOIN events e USING (game_id, event_id)
-JOIN transcript t
-  ON t.game_id = s.game_id
- AND t.end_sec   >= e.calibrated_transcript_time - 3
- AND t.start_sec <= e.calibrated_transcript_time + 10
-ORDER BY s.game_id, e.calibrated_transcript_time, t.start_sec;
+JOIN videos v ON v.game_id = s.game_id
+JOIN alignments a ON a.alignment_id = v.alignment_id AND a.passed
+JOIN captions c
+  ON c.video_id = v.video_id
+ AND c.end_sec   >= e.video_sec - 3
+ AND c.start_sec <= e.video_sec + 10
+ORDER BY s.game_id, e.video_sec, c.start_sec;
 ```
 
 Caption lines are 5–10 second blocks, so a line that starts a few seconds before the event can
@@ -90,10 +108,10 @@ database). Connecting applies any pending ones and records them in `schema_versi
 scripts never create or alter tables themselves. To change the schema, add the next numbered
 file. `.venv/bin/python scripts/db/migrate.py status` lists what's applied.
 
-A file named `NNNN_x.postgres.sql` replaces `NNNN_x.sql` on Postgres. The initial migrations
-have both versions (ids, views and row level security differ); a later change written in
-plain SQL can be a single file. Postgres stores MoneyPuck's camelCase column names in
-lowercase, so write them unquoted (`xGoal` and `xgoal` both work).
+A file named `NNNN_x.postgres.sql` replaces `NNNN_x.sql` on Postgres. Migrations 0001 and
+0002 have both versions (identity columns, casts, views and row level security differ); a later
+change written in plain SQL can be a single file. 0002 (the redesign above) was generated from
+0001's MoneyPuck columns with `build_db.snake()`, so the loader and the schema use the same names.
 
 ## The pipeline
 
