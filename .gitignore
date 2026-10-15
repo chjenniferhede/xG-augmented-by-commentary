@@ -1,3 +1,8 @@
-data/raw/
+# All data (raw downloads, databases, logs) lives under data/ or $XG_DATA_DIR, never in git.
+data/
+.env
+*.sqlite
 __pycache__/
 .venv/
+.claude/settings.local.json
+.DS_Store

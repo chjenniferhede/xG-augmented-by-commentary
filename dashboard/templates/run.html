@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Run #{{ run[0] }} <span class="{{ run[6] }}">{{ run[6] }}</span></h1>
+<p class="muted">{{ run[2] }} · trigger {{ run[1] }} · started {{ run[4] }} UTC{% if run[5] %} · finished {{ run[5] }}{% endif %}
+  · code {{ run[7] }}</p>
+{% if run[8] %}<pre>{{ run[8] | pretty_json }}</pre>{% endif %}
+
+<h2>Steps</h2>
+<div class="wrap"><table>
+  <tr><th>Stage</th><th>Video</th><th>Game</th><th>Started</th><th>Status</th><th>YouTube req.</th><th>Note / error</th></tr>
+  {% for s in steps %}
+  <tr><td>{{ s[0] }}</td><td>{% if s[1] %}<a href="https://www.youtube.com/watch?v={{ s[1] }}">{{ s[1] }}</a>{% endif %}</td>
+      <td>{{ s[2] or "" }}</td><td>{{ s[3] }}</td><td class="{{ s[5] }}">{{ s[5] }}</td><td>{{ s[7] or 0 }}</td>
+      <td class="muted"><code>{{ (s[6] or "")[:300] }}</code></td></tr>
+  {% else %}<tr><td colspan="7" class="muted">No steps.</td></tr>{% endfor %}
+</table></div>
+
+<h2>Requests</h2>
+<div class="wrap"><table>
+  <tr><th>Kind</th><th>Status</th><th>Count</th></tr>
+  {% for k in requests_by_kind %}<tr><td><code>{{ k[0] }}</code></td><td class="{{ k[1] }}">{{ k[1] }}</td><td>{{ k[2] }}</td></tr>
+  {% else %}<tr><td colspan="3" class="muted">None.</td></tr>{% endfor %}
+</table></div>
+
+<h2>Log</h2>
+<pre>{{ log_tail or "No log file." }}</pre>
+{% endblock %}
