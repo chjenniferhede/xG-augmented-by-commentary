@@ -88,3 +88,62 @@ test("importing this module must not start a run", () => {
   assert.equal(typeof verifyQuotes, "function");
   assert.ok(!process.env.XG_ANNOTATE_RAN, "main() ran on import");
 });
+
+test("a correction that decodes a mangled name back to the recorded player is discarded", () => {
+  const s = { ...shot("a drive by Benino that would not go"), shooter: "Nick Bonino" } as ShotRow;
+  const a = ann([{ code: "shooter_correction", quote: "a drive by Benino" }]);
+  a.features[0]!.corrected_value = "Nick Bonino";   // the roster let it resolve the name correctly
+  const { kept, rejected } = verifyQuotes(a, s);
+  assert.equal(kept.length, 0, "agreeing with the data is not a correction");
+  assert.match(rejected[0]!.quote, /agrees with the data/);
+});
+
+test("a correction naming a genuinely different player is kept", () => {
+  const s = { ...shot("rolled off the stick of Antoine Verment"), shooter: "Ryan Getzlaf" } as ShotRow;
+  const a = ann([{ code: "shooter_correction", quote: "off the stick of Antoine Verment" }]);
+  a.features[0]!.corrected_value = "Antoine Vermette";
+  assert.equal(verifyQuotes(a, s).kept.length, 1);
+});
+
+test("a correction with no corrected value is discarded", () => {
+  const s = { ...shot("Now Nurse on a backhand."), shot_type: "WRIST" } as ShotRow;
+  const a = ann([{ code: "shot_type_correction", quote: "Now Nurse on a backhand" }]);
+  const { kept, rejected } = verifyQuotes(a, s);
+  assert.equal(kept.length, 0);
+  assert.match(rejected[0]!.quote, /no corrected_value/);
+});
+
+test("a shot type correction that really disagrees survives", () => {
+  const s = { ...shot("Now Nurse on a backhand."), shot_type: "WRIST" } as ShotRow;
+  const a = ann([{ code: "shot_type_correction", quote: "Now Nurse on a backhand" }]);
+  a.features[0]!.corrected_value = "BACKHAND";
+  assert.equal(verifyQuotes(a, s).kept.length, 1);
+});
+
+test("a save by the goalie is not a blocked shooting lane", () => {
+  const s = { ...shot("Cole a shot blocked away by Anderson as Malcin"),
+              goalie: "Craig Anderson" } as ShotRow;
+  const { kept, rejected } = verifyQuotes(
+    ann([{ code: "shot_blocked_lane", quote: "Cole a shot blocked away by Anderson" }]), s);
+  assert.equal(kept.length, 0);
+  assert.match(rejected[0]!.quote, /names the goalie/);
+});
+
+test("the goalie's name survives mangling in the check", () => {
+  const s = { ...shot("that one is blocked away by Talbert"), goalie: "Cam Talbot" } as ShotRow;
+  assert.equal(verifyQuotes(
+    ann([{ code: "partial_block", quote: "blocked away by Talbert" }]), s).kept.length, 0);
+});
+
+test("a genuine block by a skater is kept", () => {
+  const s = { ...shot("His shot doesn't get through, Methot in the way"),
+              goalie: "Craig Anderson" } as ShotRow;
+  assert.equal(verifyQuotes(
+    ann([{ code: "shot_blocked_lane", quote: "His shot doesn't get through" }]), s).kept.length, 1);
+});
+
+test("a screen may name the goalie -- only interception codes are checked", () => {
+  const s = { ...shot("Anderson never saw it, screened by two"), goalie: "Craig Anderson" } as ShotRow;
+  assert.equal(verifyQuotes(
+    ann([{ code: "screen_opponent", quote: "Anderson never saw it, screened by two" }]), s).kept.length, 1);
+});

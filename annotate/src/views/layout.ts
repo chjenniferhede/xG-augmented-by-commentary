@@ -72,9 +72,15 @@ tbody tr:hover { background: color-mix(in oklab, var(--ink) 4%, transparent); }
 }
 .chip.pos { border-color: color-mix(in oklab, var(--up) 45%, transparent); }
 .chip.neg { border-color: color-mix(in oklab, var(--down) 45%, transparent); }
+/* A scramble is information, not a problem: a quiet neutral chip, not the warning amber. */
 .seq { display:inline-block; margin-left:6px; padding:0 6px; border-radius:999px;
-       border:1px solid var(--border); font-size:10.5px; color:var(--ink-2); cursor:help;
-       background: color-mix(in oklab, var(--warn) 14%, transparent); }
+       border:1px solid var(--border); font-size:10.5px; color:var(--muted); cursor:help;
+       background: color-mix(in oklab, var(--ink) 5%, transparent); }
+.clip { position: relative; width: 100%; max-width: 640px; aspect-ratio: 16/9;
+         border-radius: 10px; overflow: hidden; border: 1px solid var(--border);
+         background: #000; margin: 4px 0 8px; }
+.clip iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+.at { font-variant-numeric: tabular-nums; }
 .flist { display: grid; gap: 2px; }
 .flegend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px;
            color: var(--ink-2); margin-bottom: 10px; }

@@ -11,7 +11,7 @@
  */
 
 import { FEATURES, ALREADY_IN_MODEL } from "./vocabulary.ts";
-import type { ShotRow } from "./db.ts";
+import type { Roster, ShotRow } from "./db.ts";
 
 const byGroup = () => {
   const groups = new Map<string, string[]>();
@@ -42,7 +42,9 @@ export function systemPrompt(): string {
 
   return `You read NHL broadcast commentary and extract only what an expected-goals (xG) model cannot already see.
 
-You are given a cluster of shots that happened close together in one game, and the commentary around them. Caption text is machine-transcribed from the broadcast: names are frequently mangled (Vermette -> "Verment", Draisaitl -> "Dryettle", Talbot -> "Talbat"), so never rely on exact name matching. Rely on timing and on what is being described.
+You are given a cluster of shots that happened close together in one game, and the commentary around them. Caption text is machine-transcribed from the broadcast, so names arrive mangled: Bonino as "Benino", Rakell as "Raquel", Nugent-Hopkins as "Nan Hopkins", Letestu as "Mark Latest". You are given the players who were actually in the game. A mangled name that sounds like someone on that list IS that player -- treat it as confirmation, never as a contradiction. Only report a different player when the commentary names someone who is plainly a different person from the one recorded.
+
+You are also told which goalie faced each shot. A save by that goalie is the outcome of the shot, not a feature of it: "blocked away by <goalie>", "<goalie> got that" means the goalie stopped it. Never record that as a blocked shooting lane or a deflection -- a blocked lane means an outfield player was in the way before the puck reached the goalie.
 
 THE DEFAULT ANSWER IS "NOTHING".
 Most of these windows are pre-game talk, statistics, player backstory, or the call of a *different* shot a few seconds away. If the commentary does not clearly describe the shot in question, set relevance near 0 and return no features. An empty features list is a correct, expected, common answer. Do not reach.
@@ -68,15 +70,20 @@ Return one entry per shot listed, using its event_id, even when there is nothing
 const fmt = (v: unknown, dash = "unknown") => (v === null || v === undefined ? dash : String(v));
 
 /** One cluster of shots plus the commentary shared around them. */
-export function userPrompt(shots: ShotRow[]): string {
+export function userPrompt(shots: ShotRow[], roster?: Roster): string {
   const lines = shots.map((s) => {
+    const forStrength = s.is_home_team ? s.home_skaters : s.away_skaters;
+    const against = s.is_home_team ? s.away_skaters : s.home_skaters;
     const flags = [
       s.shot_rebound ? "rebound" : null,
       s.shot_rush ? "off the rush" : null,
+      forStrength && against && forStrength !== against ? `${forStrength}-on-${against}` : null,
+      s.empty_net ? "empty net" : null,
     ].filter(Boolean);
     return [
       `SHOT event_id=${s.event_id}`,
       `  period ${s.period} at ${s.clock}, ${fmt(s.team)}, shooter as recorded: ${fmt(s.shooter)}`,
+      `  goalie facing it: ${fmt(s.goalie)}`,
       `  recorded type ${fmt(s.shot_type)}, ${fmt(s.distance_ft)} ft, angle ${fmt(s.angle_deg)} deg` +
         (flags.length ? ` (${flags.join(", ")})` : ""),
       `  video time ${s.video_time}`,
@@ -89,8 +96,18 @@ export function userPrompt(shots: ShotRow[]): string {
     ].join("\n");
   });
 
+  const who = roster
+    ? [
+        "",
+        "PLAYERS IN THIS GAME (the transcription mangles these; match by sound, do not report a mangled spelling as a different player):",
+        `  goalies: ${roster.goalies.join(", ")}`,
+        `  skaters: ${roster.skaters.join(", ")}`,
+      ].join("\n")
+    : "";
+
   return [
     `${shots.length} shot${shots.length === 1 ? "" : "s"} from game ${shots[0]?.game_id}, close together in time.`,
+    who,
     shots.length > 1
       ? "Their commentary windows overlap, so the same words appear more than once below. Decide which shot each detail is about; if a detail belongs to a neighbouring shot, do not attribute it here."
       : "",

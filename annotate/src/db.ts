@@ -125,6 +125,18 @@ export interface ShotRow {
   link: string;
   commentary_pre: string | null;
   commentary_post: string | null;
+  goalie: string | null;
+  home_skaters: number | null;
+  away_skaters: number | null;
+  is_home_team: boolean | null;
+  empty_net: boolean | null;
+}
+
+/** The players MoneyPuck records in a game, so mangled names can be matched to real ones. */
+export interface Roster {
+  game_id: string;
+  skaters: string[];
+  goalies: string[];
 }
 
 export async function fetchShots(opts: { game?: string; limit?: number; redo?: boolean }): Promise<ShotRow[]> {
@@ -137,11 +149,49 @@ export async function fetchShots(opts: { game?: string; limit?: number; redo?: b
   if (!opts.redo) where.push("a.game_id IS NULL");
   const limit = opts.limit ? `LIMIT ${Number(opts.limit)}` : "";
   return query<ShotRow>(
-    `SELECT s.* FROM shot_commentary_split s
+    `SELECT s.*,
+            sh.goalie_name_for_shot AS goalie,
+            sh.home_skaters_on_ice  AS home_skaters,
+            sh.away_skaters_on_ice  AS away_skaters,
+            sh.is_home_team,
+            (sh.home_empty_net OR sh.away_empty_net) AS empty_net
+       FROM shot_commentary_split s
+       JOIN shots sh USING (game_id, event_id)
        LEFT JOIN commentary_xg a USING (game_id, event_id)
       WHERE ${where.join(" AND ")}
       ORDER BY s.game_id, s.video_sec
       ${limit}`,
     params,
   );
+}
+
+/**
+ * Who was on the ice, per game.
+ *
+ * The captions are machine-transcribed, so names arrive mangled -- Bonino as "Benino", Rakell as
+ * "Raquel", Nugent-Hopkins as "Nan Hopkins". Without the real names to compare against, a model
+ * reads a mangled spelling as a different player and reports a data error that is not there.
+ * Giving it the roster turns that guess into a lookup.
+ */
+export async function fetchRosters(gameIds: string[]): Promise<Map<string, Roster>> {
+  if (!gameIds.length) return new Map();
+  const rows = await query<{ game_id: string; player: string; is_goalie: boolean }>(
+    `SELECT game_id, shooter_name AS player, false AS is_goalie
+       FROM shots WHERE game_id = ANY($1) AND shooter_name IS NOT NULL
+     UNION
+     SELECT game_id, goalie_name_for_shot, true
+       FROM shots WHERE game_id = ANY($1) AND goalie_name_for_shot IS NOT NULL`,
+    [gameIds],
+  );
+  const out = new Map<string, Roster>();
+  for (const r of rows) {
+    const e = out.get(r.game_id) ?? { game_id: r.game_id, skaters: [], goalies: [] };
+    (r.is_goalie ? e.goalies : e.skaters).push(r.player);
+    out.set(r.game_id, e);
+  }
+  for (const e of out.values()) {
+    e.skaters.sort();
+    e.goalies.sort();
+  }
+  return out;
 }

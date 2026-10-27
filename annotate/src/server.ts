@@ -19,6 +19,26 @@ import { featureDef, FEATURES } from "./vocabulary.ts";
 import type { ScoredFeature } from "./coefficients.ts";
 
 const app = new Hono();
+
+/**
+ * The moment, embedded.
+ *
+ * A watch-page link carries the time in `t=`, but YouTube only acts on it when the page loads
+ * fresh: if that video is already open the player keeps its own position and the link appears to
+ * do nothing. The embed player takes `start=` and always honours it, so the detail page plays
+ * the moment itself rather than relying on a link that may be ignored.
+ *
+ * youtube-nocookie.com is the same player without the tracking cookies, which suits a project
+ * that keeps its YouTube data to itself.
+ */
+const clip = (videoId: string, atSec: number, label: string): string => {
+  const start = Math.max(Math.trunc(atSec) - 5, 0); // 5 s early, for the build-up
+  return `<div class="clip"><iframe
+      src="https://www.youtube-nocookie.com/embed/${esc(videoId)}?start=${start}&rel=0"
+      title="${esc(label)}" loading="lazy" allowfullscreen
+      allow="accelerometer; clipboard-write; encrypted-media; picture-in-picture"></iframe></div>`;
+};
+
 const pct = (n: number | null | undefined, d = 1) =>
   n === null || n === undefined ? "–" : `${(n * 100).toFixed(d)}%`;
 const signedPts = (n: number | null | undefined) =>
@@ -29,7 +49,7 @@ interface ListRow {
   clock: string; team: string | null; x_goal: number; xg_adjusted_pre: number;
   xg_adjusted_full: number; delta_pre: number; delta_full: number; relevance: number;
   summary: string | null; features: ScoredFeature[] | null; youtube_url: string;
-  outcome_leaked: boolean;
+  outcome_leaked: boolean; video_id: string; video_time: string;
   seq_pos?: number; seq_len?: number; seq_span?: number;
 }
 
@@ -96,6 +116,7 @@ app.get("/", async (c) => {
      SELECT c.game_id, c.event_id, s.shooter, s.result, s.period, s.clock, s.team,
             c.x_goal, c.xg_adjusted_pre, c.xg_adjusted_full, c.delta_pre, c.delta_full,
             c.relevance, c.summary, c.features, c.youtube_url, c.outcome_leaked,
+            c.video_id, s.video_time,
             q.seq_pos, q.seq_len, q.seq_span
        FROM commentary_xg c
        JOIN shot_commentary_split s USING (game_id, event_id)
@@ -155,7 +176,8 @@ app.get("/", async (c) => {
           <div class="muted">${signedPts(r.delta_full)}</div></td>
       <td>${deltaBar(barOnPre ? r.delta_pre : r.delta_full, maxDelta)}</td>
       <td class="hide-sm">${esc(r.summary ?? "")}<div>${chips(r.features)}</div></td>
-      <td><a href="${esc(r.youtube_url)}" target="_blank" rel="noreferrer" title="watch this moment">▶</a></td>
+      <td><a href="/shot/${r.game_id}/${r.event_id}" title="play this moment in the dashboard">▶</a>
+          <div class="muted at">${esc(r.video_time ?? "")}</div></td>
     </tr>`).join("")}
     </tbody>
   </table>`}
@@ -167,6 +189,7 @@ app.get("/shot/:game/:event", async (c) => {
   const rows = await query<ListRow & {
     explanation: string | null; commentary_pre: string | null; commentary_post: string | null;
     model: string | null; provider: string | null; coeff_version: string | null; video_sec: number;
+    video_id: string;
     attribution_confidence: number | null; commentary_quality: string | null;
     leak_note: string | null; video_time: string;
   }>(
@@ -209,8 +232,11 @@ app.get("/shot/:game/:event", async (c) => {
       <div class="tile"><div class="k">Relevance</div><div class="v">${r.relevance?.toFixed(2) ?? "–"}</div>
         <div class="sub">${esc(r.commentary_quality ?? "")}</div></div>
     </div>
-    <p style="margin:14px 0 4px"><a href="${esc(r.youtube_url)}" target="_blank" rel="noreferrer">
-      ▶ Watch at ${esc(r.video_time)}</a></p>
+    ${clip(r.video_id, r.video_sec, `${r.shooter ?? "shot"} at ${r.video_time}`)}
+    <p class="muted">Starts 5 s before the shot, at ${esc(r.video_time)} of the replay.
+       <a href="${esc(r.youtube_url)}" target="_blank" rel="noreferrer">Open on YouTube</a>
+       — note that if this video is already open in another tab, YouTube keeps its own position
+       and ignores the timestamp; the player above always starts in the right place.</p>
     ${r.outcome_leaked ? `<p class="muted">⚠ The pre-shot window gave the result away: ${esc(r.leak_note ?? "")}</p>` : ""}
     ${neighbours.length > 1 ? `<p class="muted">Part of a scramble — ${neighbours.length} shots within
        ${Math.round((neighbours[neighbours.length - 1]!.video_sec) - (neighbours[0]!.video_sec))}s,
@@ -262,6 +288,7 @@ app.get("/pre", async (c) => {
      SELECT c.game_id, c.event_id, s.shooter, s.result, s.period, s.clock, s.team,
             c.x_goal, c.xg_adjusted_pre, c.xg_adjusted_full, c.delta_pre, c.delta_full,
             c.relevance, c.summary, c.features, c.youtube_url, c.outcome_leaked,
+            c.video_id, s.video_time,
             q.seq_pos, q.seq_len, q.seq_span
        FROM commentary_xg c
        JOIN shot_commentary_split s USING (game_id, event_id)
@@ -312,7 +339,8 @@ app.get("/pre", async (c) => {
       <td class="num">${pct(r.xg_adjusted_pre)}<div class="muted">${signedPts(r.delta_pre)}</div></td>
       <td>${deltaBar(r.delta_pre, maxDelta)}</td>
       <td class="hide-sm">${esc(r.summary ?? "")}<div>${chips(r.features, "pre")}</div></td>
-      <td><a href="${esc(r.youtube_url)}" target="_blank" rel="noreferrer" title="watch this moment">▶</a></td>
+      <td><a href="/shot/${r.game_id}/${r.event_id}" title="play this moment in the dashboard">▶</a>
+          <div class="muted at">${esc(r.video_time ?? "")}</div></td>
     </tr>`).join("")}
     </tbody></table>`}
   </div>`;

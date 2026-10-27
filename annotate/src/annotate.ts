@@ -15,7 +15,8 @@
 import { generateText, Output, type LanguageModel } from "ai";
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
-import { assertSchema, close, fetchShots, loadEnv, query, type ShotRow } from "./db.ts";
+import { assertSchema, close, fetchRosters, fetchShots, loadEnv, query,
+         type Roster, type ShotRow } from "./db.ts";
 import { resolveProvider, type ProviderConfig } from "./provider.ts";
 import { clusterShots } from "./cluster.ts";
 import { RateLimiter } from "./limiter.ts";
@@ -69,7 +70,51 @@ export function verifyQuotes(
   const both = `${haystacks.pre} ${haystacks.post}`;
   const kept: ScoredFeature[] = [];
   const rejected: { code: string; quote: string }[] = [];
+  // What each correction code claims is wrong, so its proposed value can be compared with it.
+  const recorded: Record<string, string | null> = {
+    shooter_correction: shot.shooter,
+    shot_type_correction: shot.shot_type,
+    location_dispute: null, // free-form; only the missing-value check applies
+  };
+  const sameName = (a: string, b: string) =>
+    normalise(a).replace(/[^a-z ]/g, "") === normalise(b).replace(/[^a-z ]/g, "");
+
+  // Codes that all mean "something stopped or turned the puck before it reached the goalie".
+  // The goalie doing it is the outcome of the shot, not a property of the chance.
+  const INTERCEPTION = ["shot_blocked_lane", "partial_block",
+                        "deflect_off_defender", "deflect_off_teammate"];
+  // Surnames survive transcription better than first names, and a short stem absorbs the usual
+  // damage (Talbot -> "Talbert", so the stem "talb" still matches).
+  const goalieStem = (() => {
+    const last = (shot.goalie ?? "").trim().split(/\s+/).pop() ?? "";
+    return last.length >= 4 ? normalise(last).slice(0, 4) : "";
+  })();
+  const namesTheGoalie = (quote: string) =>
+    !!goalieStem && normalise(quote).split(" ").some((w) => w.startsWith(goalieStem));
+
   for (const f of ann.features) {
+    // Measured case: "Cole a shot blocked away by Anderson" became shot_blocked_lane, when
+    // Anderson is the goalie and that sentence is simply a save. Telling the model who the
+    // goalie is fixed its summary but not its choice of code, so the check lives here.
+    if (INTERCEPTION.includes(f.code) && namesTheGoalie(f.quote)) {
+      rejected.push({ code: f.code, quote: `names the goalie (${shot.goalie}); that is a save` });
+      continue;
+    }
+    if (f.code in recorded) {
+      // Two ways a "correction" turns out to be nothing. One: it never says what the value
+      // should be, so it is a suspicion rather than a finding. Two -- much the commoner, once
+      // the roster is in the prompt -- it decodes a mangled transcription back to the player
+      // already recorded ("Benino" -> Nick Bonino) and files that agreement as a correction.
+      if (!f.corrected_value) {
+        rejected.push({ code: f.code, quote: "no corrected_value given" });
+        continue;
+      }
+      const was = recorded[f.code];
+      if (was && sameName(f.corrected_value, was)) {
+        rejected.push({ code: f.code, quote: `agrees with the data (${was})` });
+        continue;
+      }
+    }
     const needle = normalise(f.quote);
     // Accept a quote found in either window; trust the model's own source tag for which it was,
     // but require that the words exist somewhere in what we actually sent.
@@ -293,6 +338,7 @@ async function main(): Promise<void> {
   const limiter = new RateLimiter(cfg.rpm, cfg.tokensPerDay);
   const shots = await fetchShots({ game: args.game, limit: args.limit, redo: args.redo });
   const clusters = clusterShots(shots);
+  const rosters = await fetchRosters([...new Set(shots.map((s) => s.game_id))]);
   console.log(
     `${cfg.name} [${cfg.modelIds.join(" -> ")}]: ${shots.length} shots in ${clusters.length} clusters ` +
       `(${cfg.rpm} rpm${cfg.tokensPerDay ? `, ${cfg.tokensPerDay} tokens/day` : ""})` +
@@ -317,7 +363,7 @@ async function main(): Promise<void> {
       `events ${cluster.map((s) => s.event_id).join(",")}`;
 
     if (args.dryRun) {
-      console.log(`\n${label}\n${userPrompt(cluster).slice(0, 1200)}\n...`);
+      console.log(`\n${label}\n${userPrompt(cluster, rosters.get(cluster[0]!.game_id))}\n`);
       continue;
     }
 
