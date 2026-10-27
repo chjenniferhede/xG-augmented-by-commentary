@@ -8,7 +8,13 @@
       "Bash(python3 -c \"import sqlite3; print\\(sqlite3.sqlite_version\\)\")",
       "Bash(.venv/bin/python -c \"import sqlite3; print\\(sqlite3.sqlite_version\\)\")",
       "Bash(git add *)",
-      "Bash(DATABASE_URL= ../.venv/bin/python -)"
+      "Bash(DATABASE_URL= ../.venv/bin/python -)",
+      "Read(//Users/jen/**)",
+      "Read(//Users/jen/Documents/**)",
+      "Read(//Users/jen/Desktop/**)",
+      "Bash(cp project_3.ipynb \"/private/tmp/claude-501/-Users-jen-Documents-Personal-Repos-xG-augmented-by-commentary/9495f9d6-78ef-4ee5-b182-e4488ef2ea07/scratchpad/project_3.backup.ipynb\")",
+      "Bash(python3 \"/private/tmp/claude-501/-Users-jen-Documents-Personal-Repos-xG-augmented-by-commentary/9495f9d6-78ef-4ee5-b182-e4488ef2ea07/scratchpad/patch_nb.py\")",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

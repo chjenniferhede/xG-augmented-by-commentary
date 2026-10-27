@@ -49,12 +49,19 @@ STAGE_LABELS = {"captions": "Fetch captions", "game_data": "Load MoneyPuck data"
 VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 
 
+# Runs launched from here stay children of this process, so each one becomes a zombie when it
+# ends until somebody waits on it. Nothing here ever needs a run's exit status -- the outcome is
+# in the ops database -- so finished children are reaped on the way past.
+_spawned: list[subprocess.Popen] = []
+
+
 def spawn(*args: str) -> None:
     """Start a pipeline command in the background; it outlives this request."""
-    subprocess.Popen(
+    _spawned[:] = [p for p in _spawned if p.poll() is None]  # reap whatever has finished
+    _spawned.append(subprocess.Popen(
         [sys.executable, str(SCRIPTS / "pipeline.py"), *args, "--trigger", "ui"],
         cwd=paths.ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-    )
+    ))
     time.sleep(1.0)  # let it take the lock, so the page shows it running
 
 

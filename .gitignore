@@ -3,6 +3,10 @@ data/
 .env
 *.sqlite
 __pycache__/
+node_modules/
+annotate/dist/
+# The gold set embeds caption text, which is YouTube data and stays off git like data/.
+annotate/gold/*.json
 .venv/
 .claude/settings.local.json
 .DS_Store

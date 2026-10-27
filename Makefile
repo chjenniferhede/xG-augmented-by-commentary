@@ -2,7 +2,9 @@
 PY := .venv/bin/python
 
 .PHONY: help setup run-dash stop-dash run run-captions stop-run watch dry-run status discover rebuild test migrate-status \
-        schedule-install schedule-status schedule-uninstall
+        schedule-install schedule-status schedule-uninstall \
+        annotate-setup annotate annotate-pilot annotate-dry recompute calibrate eval-gold \
+        run-xg-dash stop-xg-dash test-annotate
 
 help:  ## list the shortcuts
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-20s %s\n", $$1, $$2}'
@@ -54,3 +56,39 @@ schedule-status:  ## is the weekly job installed?
 
 schedule-uninstall:  ## remove the weekly job
 	$(PY) scripts/install_schedule.py uninstall
+
+# --- commentary -> xG (annotate/, Node) -------------------------------------
+# Reads the same Postgres warehouse. The schema belongs to the Python migrations above;
+# this side only reads and writes rows.
+NPM := npm --prefix annotate
+
+annotate-setup:  ## install the Node dependencies for annotate/
+	$(NPM) install
+
+annotate-pilot:  ## annotate 50 shots (free tier; check the output before a full run)
+	$(NPM) run annotate -- --limit 50
+
+annotate:  ## annotate every shot not done yet (resumable; stops when the day's quota runs out)
+	$(NPM) run annotate
+
+annotate-dry:  ## show the prompt for 2 shots; calls no model, writes nothing
+	$(NPM) run annotate -- --dry-run --limit 2
+
+recompute:  ## re-score stored features against the current coefficients; no model calls
+	$(NPM) run annotate -- --recompute
+
+calibrate:  ## normalise the adjusted xG and score it against real goals
+	$(NPM) run calibrate
+
+eval-gold:  ## score extraction against the hand-labelled gold set
+	$(NPM) run eval-gold
+
+run-xg-dash:  ## start the xG dashboard at http://127.0.0.1:5058
+	$(NPM) run dash
+
+stop-xg-dash:  ## stop the xG dashboard
+	@# tsx runs it as "src/server.ts" from inside annotate/, so match on that, not the full path.
+	-@pkill -f "tsx src/server.ts" && echo "xG dashboard stopped" || echo "xG dashboard was not running"
+
+test-annotate:  ## run the annotator's unit tests
+	$(NPM) test

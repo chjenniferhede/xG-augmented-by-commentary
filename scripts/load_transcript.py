@@ -36,6 +36,19 @@ TEAMS = {
     "Utah Hockey Club": "UTA", "Mammoth": "UTA", "Canucks": "VAN", "Golden Knights": "VGK",
     "Capitals": "WSH", "Jets": "WPG",
 }
+# Short forms the replay titles use ("Leafs vs Bruins"), which the full names above miss.
+TEAM_NICKNAMES = {
+    "Leafs": "TOR", "Habs": "MTL", "Bolts": "TBL", "Caps": "WSH", "Preds": "NSH",
+    "Canes": "CAR", "Pens": "PIT", "Avs": "COL", "Sens": "OTT", "Nucks": "VAN",
+    "Knights": "VGK", "Jackets": "CBJ", "Wings": "DET", "Yotes": "ARI", "Isles": "NYI",
+    "Blueshirts": "NYR", "Bluejackets": "CBJ", "Lightning": "TBL",
+}
+TEAM_NAMES = {**TEAMS, **TEAM_NICKNAMES}
+
+# Titles name the event rather than the date for the games played outside a home rink; those are
+# the only neutral-site games in a season, so the flag alone picks them out.
+OUTDOOR_EVENTS = ("winter classic", "stadium series", "nhl outdoors", "lake tahoe",
+                  "heritage classic", "outdoor")
 NUMBERS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7}
 LANGUAGES = ["en", "en-US", "en-CA", "en-GB"]
 
@@ -130,7 +143,7 @@ def game_number_hint(data: dict):
 def resolve_game_id(data: dict) -> int:
     """Find the NHL game from the video title: teams, then the date or the season."""
     title = data["title"] or ""
-    teams = sorted({abbrev for name, abbrev in TEAMS.items() if re.search(rf"\b{name}\b", title)})
+    teams = sorted({abbrev for name, abbrev in TEAM_NAMES.items() if re.search(rf"\b{name}\b", title)})
     if len(teams) != 2:
         raise GameUnresolved(f"Could not find two NHL teams in the title {title!r}; pass --game-id.")
 
@@ -169,15 +182,39 @@ def resolve_game_id(data: dict) -> int:
             if both and g["gameType"] in ((3,) if playoffs else (2, 3)):
                 candidates.append(g)
 
+    # One game per id: a title with a bare year is looked up in two seasons, and a game must not
+    # count twice just because both lookups returned it.
+    candidates = list({g["id"]: g for g in candidates}.values())
+
     number = game_number_hint(data)
     if len(candidates) > 1 and playoffs and number:
         # A playoff game ID ends in its game number within the series.
         candidates = [g for g in candidates if g["id"] % 10 == number]
+
+    # Narrow on what else the title gives away. Each filter is only applied when it leaves at
+    # least one game, so a title the schedule disagrees with falls through to the listing below
+    # rather than resolving to nothing.
+    def narrow(keep):
+        kept = [g for g in candidates if keep(g)]
+        return kept if kept else candidates
+
+    if len(candidates) > 1:
+        if re.search(r"\bshootout\b", title, re.I):
+            candidates = narrow(lambda g: g.get("gameOutcome", {}).get("lastPeriodType") == "SO")
+        elif re.search(r"\b\d?OT\b|\bovertime\b", title, re.I):
+            candidates = narrow(lambda g: g.get("gameOutcome", {}).get("lastPeriodType") == "OT")
+    if len(candidates) > 1 and any(k in title.lower() for k in OUTDOOR_EVENTS):
+        candidates = narrow(lambda g: g.get("neutralSite"))
+
     if len(candidates) == 1:
         return candidates[0]["id"]
 
+    # Show what each candidate ended in and where it was played, so a title naming an overtime
+    # or a stadium can be matched by hand without opening the schedule.
     listing = "\n".join(
-        f"  {g['id']}  {g['gameDate']}  {g['awayTeam']['abbrev']} @ {g['homeTeam']['abbrev']}" for g in candidates
+        f"  {g['id']}  {g['gameDate']}  {g['awayTeam']['abbrev']} @ {g['homeTeam']['abbrev']}"
+        f"  {g.get('gameOutcome', {}).get('lastPeriodType', '?'):3}"
+        f"  {g.get('venue', {}).get('default', '')}" for g in candidates
     ) or "  (none found)"
     raise GameUnresolved(f"Could not pin down the game for {title!r}. Candidates:\n{listing}\nPass --game-id.")
 

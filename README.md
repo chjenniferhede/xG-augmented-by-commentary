@@ -43,7 +43,7 @@ Raw files stay on the machine that runs the pipeline: `data/raw/` is the source 
 ### Warehouse
 
 ```
-games ─┬─< events ──1:1── shots          joined on (game_id, event_id)
+games ─┬─< events ──1:1── shots ──1:1── commentary_xg   joined on (game_id, event_id)
        └── videos ─┬─< captions          one video per game
                    └─< alignments        videos.alignment_id = the alignment in effect
 loads  provenance, referenced from games (boxscore, events, shots) and videos (captions)
@@ -60,6 +60,9 @@ loads  provenance, referenced from games (boxscore, events, shots) and videos (c
 | `loads` | `load_id` | Provenance: one row per batch of loaded data, with its source URLs, raw files and their SHA-256 hashes, code version (git commit) and pipeline run |
 | `timeline` (view) | | Events and caption lines on one timeline per game, in video order |
 | `shot_commentary` (view) | | Each shot in a video whose alignment passed, with its xG, a video link and the commentary around it |
+| `shot_commentary_split` (view) | | The same, but with the commentary before and after the shot in separate columns, so the annotator can keep the outcome out of what it predicts |
+| `commentary_xg` | `(game_id, event_id)` | What the commentary says about a shot, as numbers: the extracted features, the adjusted xG, and why. Written by [annotate/](annotate/) |
+| `calibrations` | `calib_version` | Each calibration of the adjusted xG and how it scored against real goals |
 
 MoneyPuck's column names are converted to snake_case (`xGoal` → `x_goal`,
 `homeTeamExpectedGoalsEV` → `home_team_expected_goals_ev`) by `build_db.snake()`. Flags such
@@ -262,12 +265,44 @@ a base Anaconda install. The single-game scripts also run on their own:
 
 Quote links: in zsh, an unquoted `?` is read as a filename pattern and the command fails.
 
+## Commentary-adjusted xG
+
+[annotate/](annotate/) is a Node program that reads the commentary around each shot and turns it
+into an adjusted xG. MoneyPuck's model, like every public xG model, is built from the NHL's
+public play-by-play: it knows distance, angle, shot type, rebounds, rushes, strength and empty
+net, but nothing about screens, pre-shot passing, goalie position or shooter pressure. Those are
+the biggest gaps in public xG and the things commentators actually talk about.
+
+```sh
+make annotate-setup     # install the Node dependencies
+make annotate-pilot     # 50 shots
+make calibrate          # normalise, and score against real goals
+make run-xg-dash        # http://127.0.0.1:5058 - rows of change in xG, and why
+```
+
+A language model extracts only structured features — each with a confidence and a **verbatim
+quote**, and any feature whose quote is not in the text is discarded. A versioned coefficient
+table in TypeScript turns those features into the number, so the adjustment is auditable and can
+be retuned (`make recompute`) without calling a model again.
+
+Two adjusted numbers are stored. The commentary window runs past the shot and contains the call,
+so `xg_adjusted_pre` uses only what was said beforehand and is the one scored against real
+goals; `xg_adjusted_full` also uses the replay talk, where most of the screen and deflection
+detail lives, and is for reading rather than scoring.
+
+The extraction runs on a free-tier model (Gemini Flash by default; the provider is one env var).
+Google's free request quota is counted per model and is small — 20 a day on `gemini-3.8-flash`,
+measured — so the runner rotates across models and every run is resumable. Note that free tiers
+may train on what is sent to them; see [annotate/README.md](annotate/README.md).
+
 ## Sources and terms
 
 - Game events, shots and xG: [MoneyPuck.com](https://moneypuck.com/data.htm). MoneyPuck asks
   for credit when its data is used.
 - Game details and schedules: the NHL's public API (`api-web.nhle.com`).
 - Replay discovery: the official YouTube Data API.
+- Commentary feature extraction: a language model through the [Vercel AI SDK](https://ai-sdk.dev)
+  (Google Gemini by default, free tier).
 - Captions and video frames: YouTube, fetched with `youtube-transcript-api` and `yt-dlp`.
   These tools use YouTube's web-player endpoints, not an official API, and YouTube's Terms of
   Service restrict this kind of access. The rate limits above keep the volume low; they don't

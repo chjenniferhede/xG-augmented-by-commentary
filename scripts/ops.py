@@ -42,9 +42,33 @@ def setup_logging(run_id=None) -> None:
         log.addHandler(fh)
 
 
+def close_abandoned_runs() -> int:
+    """Mark runs whose process is gone as failed; returns how many were closed.
+
+    A run killed outright -- or one whose database connection dies mid-statement -- never reaches
+    finish_run, so its row claims to be running for ever and the runs list misleads. This is only
+    called from start_run, which holds the single-run lock: nothing else can be running then, so
+    every other 'running' row is stale by definition.
+    """
+    con = connect()
+    stale = [r[0] for r in con.execute("SELECT run_id FROM runs WHERE status = 'running'")]
+    if not stale:
+        return 0
+    note = "abandoned: the run's process ended without recording an outcome"
+    with con:
+        for run_id in stale:
+            con.execute("UPDATE runs SET status = 'failed', finished_at = ?, "
+                        "summary = COALESCE(summary, ?) WHERE run_id = ?",
+                        (db.now_iso(), json.dumps({"error": note}), run_id))
+            con.execute("UPDATE steps SET status = 'failed', error = COALESCE(error, ?) "
+                        "WHERE run_id = ? AND status = 'running'", (note, run_id))
+    return len(stale)
+
+
 def start_run(trigger: str, command: str, args: dict) -> int:
     global current_run_id
     con = connect()
+    abandoned = close_abandoned_runs()
     with con:
         current_run_id = con.execute(
             "INSERT INTO runs (trigger, command, args, started_at, status, git_commit, pid) "
@@ -52,6 +76,8 @@ def start_run(trigger: str, command: str, args: dict) -> int:
             (trigger, command, json.dumps(args), db.now_iso(), db.code_version(), os.getpid()),
         ).fetchone()[0]
     setup_logging(current_run_id)
+    if abandoned:
+        log.warning("closed %d abandoned run(s) left 'running' by a process that died", abandoned)
     log.info("run %s started: %s %s (trigger=%s)", current_run_id, command, args, trigger)
     return current_run_id
 

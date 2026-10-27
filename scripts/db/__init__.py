@@ -127,16 +127,35 @@ class PgConnection:
     def _sql(query: str) -> str:
         return query.replace("%", "%%").replace("?", "%s")
 
+    def _reset(self):
+        """Replace a connection that failed part-way through a statement.
+
+        psycopg leaves such a connection with a command still pending, so everything sent on it
+        afterwards raises "another command is already in progress" -- including the error handling
+        that would have recorded the original failure and closed the run out. Replacing it keeps
+        the first error visible and lets the caller finish tidily.
+        """
+        try:
+            self._con.close()
+        except Exception:
+            pass
+        self._tx.clear()  # whatever was open died with the socket
+        self._open()
+
     def _run(self, fn):
         import psycopg
 
         try:
             return fn()
         except psycopg.OperationalError:
-            if self._tx or not (self._con.closed or self._con.broken):
+            # Read both before resetting: a fresh connection is neither closed nor broken.
+            replayable = (self._con.closed or self._con.broken) and not self._tx
+            self._reset()
+            if not replayable:
+                # Either a transaction died -- its work is gone whichever way -- or the statement
+                # may have reached the server, and replaying an insert would duplicate a row.
                 raise
-            self._open()  # the connection dropped between statements (idle for a long run): retry once
-            return fn()
+            return fn()  # the connection dropped between statements (a long run goes idle)
 
     def execute(self, query: str, params=None):
         if params is None:
@@ -158,12 +177,19 @@ class PgConnection:
         self._con.execute(script)
 
     def __enter__(self):
-        tx = self._con.transaction()
-        tx.__enter__()
-        self._tx.append(tx)
+        # Through _run, so that a connection which died while idle is replaced before BEGIN
+        # rather than failing the whole run on its first write.
+        def begin():
+            tx = self._con.transaction()
+            tx.__enter__()
+            return tx
+
+        self._tx.append(self._run(begin))
         return self
 
     def __exit__(self, *exc):
+        if not self._tx:
+            return False  # the connection was reset under us; the transaction went with it
         return self._tx.pop().__exit__(*exc)
 
     def close(self):
