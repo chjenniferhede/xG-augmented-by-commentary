@@ -374,7 +374,7 @@ async function main(): Promise<void> {
       const { result, modelId } = await callWithRotation(cfg, limiter, exhausted, () => ({
         output: Output.object({ schema: clusterResponseSchema }),
         system,
-        prompt: userPrompt(cluster),
+        prompt: userPrompt(cluster, rosters.get(cluster[0]!.game_id)),
         temperature: 0,
         maxOutputTokens: 4000,
         maxRetries: 0,
