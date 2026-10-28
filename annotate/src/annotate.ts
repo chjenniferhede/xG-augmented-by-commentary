@@ -50,6 +50,22 @@ function parseArgs(argv: string[]): Args {
 const normalise = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
 
 /**
+ * Which window a quote came from, read off the text rather than the model's own tag. All three
+ * arguments must already be normalised; null means the quote is in neither.
+ *
+ * The model's tag is wrong often enough to matter for xg_adjusted_pre: measured over the stored
+ * features, 10 tagged "post" quoted the pre-shot window (evidence the honest number never saw)
+ * and 2 tagged "pre" quoted only the replay talk (post-shot detail leaking into it). A quote
+ * found in both windows counts as pre -- the words had been said before the shot either way. One
+ * found only across the join of the two contains post-shot words, so it counts as post.
+ */
+export function quoteSource(needle: string, pre: string, post: string): "pre" | "post" | null {
+  if (pre.includes(needle)) return "pre";
+  if (post.includes(needle) || `${pre} ${post}`.includes(needle)) return "post";
+  return null;
+}
+
+/**
  * Drop any feature whose quote is not actually in the commentary we supplied. This is the main
  * defence against a small model inventing a screen that nobody mentioned; it is checked here
  * rather than in the schema because only this layer knows what text the model was given.
@@ -67,7 +83,6 @@ export function verifyQuotes(
     pre: normalise(shot.commentary_pre ?? ""),
     post: normalise(shot.commentary_post ?? ""),
   };
-  const both = `${haystacks.pre} ${haystacks.post}`;
   const kept: ScoredFeature[] = [];
   const rejected: { code: string; quote: string }[] = [];
   // What each correction code claims is wrong, so its proposed value can be compared with it.
@@ -116,11 +131,12 @@ export function verifyQuotes(
       }
     }
     const needle = normalise(f.quote);
-    // Accept a quote found in either window; trust the model's own source tag for which it was,
-    // but require that the words exist somewhere in what we actually sent.
-    if (needle.length >= 8 && both.includes(needle)) {
+    // Accept a quote found in either window, and tag it with the window it was actually found
+    // in, not the one the model claims (see quoteSource).
+    const source = needle.length >= 8 ? quoteSource(needle, haystacks.pre, haystacks.post) : null;
+    if (source) {
       kept.push({
-        code: f.code, confidence: f.confidence, source: f.source,
+        code: f.code, confidence: f.confidence, source,
         quote: f.quote, correctedValue: f.corrected_value,
       });
     } else {
@@ -215,9 +231,10 @@ async function recompute(): Promise<void> {
 
   const rows = await query<{
     game_id: string; event_id: string; x_goal: number; features: ScoredFeature[]; relevance: number;
-    outcome_leaked: boolean; leak_note: string | null; commentary_pre: string | null;
+    outcome_leaked: boolean; leak_note: string | null;
+    commentary_pre: string | null; commentary_post: string | null;
   }>(`SELECT game_id, event_id, x_goal, features, relevance,
-             outcome_leaked, leak_note, commentary_pre FROM commentary_xg`);
+             outcome_leaked, leak_note, commentary_pre, commentary_post FROM commentary_xg`);
   console.log(
     `Re-scoring ${rows.length} rows against coefficients ${COEFF_VERSION}` +
       (cal ? ` with calibration ${cal.calib_version} (alpha ${cal.alpha.toFixed(4)})` : " (uncalibrated)") +
@@ -225,7 +242,15 @@ async function recompute(): Promise<void> {
   );
   let changed = 0;
   for (const r of rows) {
-    const feats = (r.features ?? []) as ScoredFeature[];
+    // Re-derive each feature's window from the stored text, as a fresh annotation now does, so
+    // rows written while the model's own tag was trusted are corrected without a model call. A
+    // stored quote was verified against this same text, so it is always found; if it somehow
+    // isn't, post is the safe side -- it keeps the quote out of the pre-shot number.
+    const preText = normalise(r.commentary_pre ?? "");
+    const postText = normalise(r.commentary_post ?? "");
+    const feats = ((r.features ?? []) as ScoredFeature[]).map((f) => ({
+      ...f, source: quoteSource(normalise(f.quote), preText, postText) ?? "post",
+    }));
     const pre = adjust(r.x_goal ?? 0, feats.filter((f) => f.source === "pre"), r.relevance ?? 0, calib);
     const full = adjust(r.x_goal ?? 0, feats, r.relevance ?? 0, calib);
     // Re-check the leak claim against the stored text, the same way a fresh annotation would.
@@ -236,13 +261,14 @@ async function recompute(): Promise<void> {
     const res = await query<{ updated: number }>(
       `UPDATE commentary_xg
           SET xg_adjusted_pre = $3, xg_adjusted_full = $4, delta_pre = $5, delta_full = $6,
-              explanation = $7, coeff_version = $8, outcome_leaked = $9, leak_note = $10
+              explanation = $7, coeff_version = $8, outcome_leaked = $9, leak_note = $10,
+              features = $11::jsonb
         WHERE game_id = $1 AND event_id = $2
           AND (coeff_version IS DISTINCT FROM $8 OR xg_adjusted_full IS DISTINCT FROM $4
-               OR outcome_leaked IS DISTINCT FROM $9)
+               OR outcome_leaked IS DISTINCT FROM $9 OR features IS DISTINCT FROM $11::jsonb)
         RETURNING 1 AS updated`,
       [r.game_id, r.event_id, pre.xgAdjusted, full.xgAdjusted, pre.delta, full.delta,
-       explain(full), COEFF_VERSION, leaked, leaked ? r.leak_note : null],
+       explain(full), COEFF_VERSION, leaked, leaked ? r.leak_note : null, JSON.stringify(feats)],
     );
     if (res.length) changed++;
   }
