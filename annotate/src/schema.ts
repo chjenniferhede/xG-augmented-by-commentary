@@ -10,7 +10,7 @@
 import { z } from "zod";
 import { FEATURE_CODES } from "./vocabulary.ts";
 
-export const PROMPT_VERSION = "p3";
+export const PROMPT_VERSION = "p4";
 
 export const featureSchema = z.object({
   code: z.enum(FEATURE_CODES).describe("one of the listed feature codes"),
