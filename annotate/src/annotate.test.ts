@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { verifyQuotes, isQuotaExhausted } from "./annotate.ts";
+import { verifyQuotes, isQuotaExhausted, quoteSource } from "./annotate.ts";
 import type { ShotRow } from "./db.ts";
 import type { ShotAnnotation } from "./schema.ts";
 
@@ -42,6 +42,35 @@ test("a post-window quote is accepted for a post-sourced feature", () => {
     ann([{ code: "off_skate_or_body", quote: "goes off of the Anaheim defender", source: "post" }]), s);
   assert.equal(kept.length, 1);
   assert.equal(kept[0]!.source, "post");
+});
+
+test("a pre-window quote the model tagged post is counted as pre", () => {
+  // Measured case (2017030415/290): the pass was said before the shot, but tagged post, so it
+  // moved only the with-replay number and the pre-shot xG never saw it.
+  const s = shot("Here's Ovkin to the slot. Got it across.", "with Flurry down and taking away any angle");
+  const { kept } = verifyQuotes(
+    ann([{ code: "cross_ice_pass", quote: "Here's Ovkin to the slot. Got it across.", source: "post" }]), s);
+  assert.equal(kept[0]!.source, "pre");
+});
+
+test("a post-window quote the model tagged pre is counted as post", () => {
+  const s = shot("Carries it in.", "the bounce goes off of the Anaheim defender");
+  const { kept } = verifyQuotes(
+    ann([{ code: "off_skate_or_body", quote: "goes off of the Anaheim defender", source: "pre" }]), s);
+  assert.equal(kept[0]!.source, "post", "replay talk must not reach the pre-shot number");
+});
+
+test("a quote that straddles the two windows is counted as post", () => {
+  const s = shot("he walks in alone and", "fires it top shelf");
+  const { kept } = verifyQuotes(
+    ann([{ code: "shooter_unpressured", quote: "walks in alone and fires it", source: "pre" }]), s);
+  assert.equal(kept[0]!.source, "post");
+});
+
+test("quoteSource prefers pre when the words appear in both windows", () => {
+  assert.equal(quoteSource("nobody home", "backdoor nobody home", "replay nobody home"), "pre");
+  assert.equal(quoteSource("nobody home", "a point shot", "replay nobody home"), "post");
+  assert.equal(quoteSource("nobody home", "a point shot", "a save"), null);
 });
 
 test("a trivially short quote is rejected rather than matching by accident", () => {
