@@ -3,7 +3,7 @@ PY := .venv/bin/python
 
 .PHONY: help setup run-dash stop-dash run run-captions stop-run watch dry-run status discover rebuild test migrate-status \
         schedule-install schedule-status schedule-uninstall \
-        annotate-setup annotate annotate-pilot annotate-dry recompute calibrate eval-gold \
+        annotate-setup annotate annotate-pilot annotate-dry recompute calibrate goals eval-gold \
         run-xg-dash stop-xg-dash test-annotate
 
 help:  ## list the shortcuts
@@ -79,6 +79,9 @@ recompute:  ## re-score stored features against the current coefficients; no mod
 
 calibrate:  ## normalise the adjusted xG and score it against real goals
 	$(NPM) run calibrate
+
+goals:  ## re-rank the goals by their commentary, total xG held fixed; writes data/out/goals.csv
+	$(NPM) run goals
 
 eval-gold:  ## score extraction against the hand-labelled gold set
 	$(NPM) run eval-gold
