@@ -14,9 +14,11 @@ import { assertSchema, loadEnv, query } from "./db.ts";
 import { esc, page } from "./views/layout.ts";
 import { deltaBar, featureTable, reliabilityChart, type RelBin } from "./views/charts.ts";
 import { chips } from "./views/chips.ts";
-import { WEIGHTS } from "./coefficients.ts";
+import { COEFF_VERSION, logit, sigmoid, WEIGHTS } from "./coefficients.ts";
 import { featureDef, FEATURES } from "./vocabulary.ts";
 import type { ScoredFeature } from "./coefficients.ts";
+import { fetchGoals, GROUPS, liveCodes, refineGoals, usableFeatures, type RefinedGoal } from "./goals.ts";
+import { featureLabel } from "./views/labels.ts";
 
 const app = new Hono();
 
@@ -345,6 +347,248 @@ app.get("/pre", async (c) => {
     </tbody></table>`}
   </div>`;
   return c.html(page("Pre-shot – commentary xG", "/pre", body));
+});
+
+/**
+ * Goals only: every goal re-ranked by what the commentary says about the chance, with the total
+ * held at MoneyPuck's. The arithmetic lives in goals.ts and is the same code `make goals` runs;
+ * this page only reads options from the URL, so a scenario is a shareable link and the page
+ * works without JavaScript (the one inline handler just saves clicking Apply).
+ */
+const SCALES = [
+  { v: 0, label: "Off" }, { v: 0.5, label: "Half" }, { v: 1, label: "Normal" }, { v: 2, label: "Double" },
+] as const;
+
+/** Examples shown under each group so "Deflections and blocks" means something to an outsider. */
+const GROUP_EXAMPLES: Record<string, string> = {
+  A: "screened goalie, traffic in front",
+  B: "tipped or deflected shots, partly blocked shots",
+  C: "goalie out of position, goalie set and square",
+  D: "cross-ice pass, back-door play, one-timer",
+  E: "wide open in the slot, quick release, shooter under pressure",
+  F: "breakaway, rebound scramble",
+};
+
+interface Scenario { name: string; blurb: string; params: Record<string, string> }
+const SCENARIOS: Scenario[] = [
+  { name: "Our model", blurb: "Pre-shot and replay commentary; goalie state on the replay ignored.", params: {} },
+  { name: "Before the shot only", blurb: "Ignore the replay, as in our earlier approach.", params: { replay: "off" } },
+  { name: "Count goalie on replay", blurb: "Also count “goalie out of position” said on the replay.", params: { finish: "keep" } },
+  { name: "Without passing", blurb: "Passes before the shot count for nothing.", params: { gD: "0" } },
+  { name: "Without screens", blurb: "Screens and traffic count for nothing.", params: { gA: "0" } },
+];
+
+const SORTS = [
+  { v: "rise", label: "Biggest rise" },
+  { v: "fall", label: "Biggest fall" },
+  { v: "long", label: "Long-shot goals" },
+  { v: "best", label: "Best chances" },
+] as const;
+
+/** MoneyPuck's number and ours on one shared 0-to-max scale, so the move is the picture. */
+function dumbbell(base: number, refined: number, max: number, width = 180, height = 22): string {
+  const x = (p: number) => 6 + (Math.min(p, max) / max) * (width - 12);
+  const up = refined >= base;
+  const colour = up ? "var(--up)" : "var(--down)";
+  return `<svg class="bar" width="${width}" height="${height}" role="img"
+      aria-label="MoneyPuck ${(base * 100).toFixed(1)}%, refined ${(refined * 100).toFixed(1)}%">
+    <line x1="6" y1="${height / 2}" x2="${width - 6}" y2="${height / 2}" stroke="var(--grid)" stroke-width="2"/>
+    <line x1="${x(base).toFixed(1)}" y1="${height / 2}" x2="${x(refined).toFixed(1)}" y2="${height / 2}"
+          stroke="${colour}" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="${x(base).toFixed(1)}" cy="${height / 2}" r="5" fill="var(--surface-1)" stroke="var(--muted)" stroke-width="2"/>
+    <circle cx="${x(refined).toFixed(1)}" cy="${height / 2}" r="6" fill="${colour}"/></svg>`;
+}
+
+const ordinal = (n: number) => {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return `${n}${s[(v - 20) % 10] ?? s[v] ?? s[0]}`;
+};
+const periodName = (p: number | null) =>
+  p === null ? "" : p <= 3 ? `${ordinal(p)} period` : p === 4 ? "OT" : `${p - 3}OT`;
+
+app.get("/goals", async (c) => {
+  const qp = (k: string) => c.req.query(k) ?? "";
+  const replay = qp("replay") !== "off";
+  const dropFinish = qp("finish") !== "keep";
+  const groupScale: Record<string, number> = {};
+  for (const g of GROUPS) {
+    const raw = qp(`g${g.key}`);
+    const v = Number(raw);
+    if (raw !== "" && SCALES.some((s) => s.v === v) && v !== 1) groupScale[g.key] = v;
+  }
+  const sort = SORTS.some((s) => s.v === qp("sort")) ? qp("sort") : "rise";
+  const search = qp("q").trim();
+
+  const all = await fetchGoals();
+  const res = refineGoals(all, {
+    useReplay: replay, dropReplayFinish: dropFinish,
+    ...(Object.keys(groupScale).length ? { groupScale } : {}),
+  });
+  const ours = refineGoals(all); // "Our model", for comparison when a scenario is active
+
+  // Ranks are over all goals, so the search hides rows but never changes the numbers.
+  const rankOf = (key: (r: RefinedGoal) => number) => {
+    const m = new Map<RefinedGoal, number>();
+    [...res.goals].sort((a, b) => key(b) - key(a)).forEach((r, i) => m.set(r, i + 1));
+    return m;
+  };
+  const rankBase = rankOf((r) => r.xgBase);
+  const rankRef = rankOf((r) => r.xgRefined);
+
+  const LONG_SHOT = 0.05;
+  const change = (r: RefinedGoal) => r.xgRefined - r.xgBase;
+  const fromFeatures = (r: RefinedGoal) => sigmoid(logit(r.xgBase) + r.featureShift) - r.xgBase;
+  const orders: Record<string, (a: RefinedGoal, b: RefinedGoal) => number> = {
+    rise: (a, b) => change(b) - change(a),
+    fall: (a, b) => change(a) - change(b),
+    long: (a, b) => change(b) - change(a),
+    best: (a, b) => b.xgRefined - a.xgRefined,
+  };
+  const needle = search.toLowerCase();
+  const rows = res.goals
+    .filter((r) => sort !== "long" || r.xgBase < LONG_SHOT)
+    .filter((r) => !needle ||
+      `${r.goal.shooter ?? ""} ${r.goal.team ?? ""} ${r.goal.game_id}`.toLowerCase().includes(needle))
+    .sort(orders[sort]!);
+
+  const movedBy = (x: typeof res) => x.goals.filter((r) => r.featureShift !== 0).length;
+  const longShots = res.goals.filter((r) => r.xgBase < LONG_SHOT);
+  const longUp = longShots.filter((r) => r.xgRefined > r.xgBase).length;
+  const nGames = new Set(all.map((g) => g.game_id)).size;
+  const scaleMax = Math.min(1, Math.ceil(Math.max(...res.goals.map((r) => Math.max(r.xgBase, r.xgRefined)), 0.1) * 10) / 10);
+
+  // Which scenario is on: a preset if the settings match one exactly, otherwise "Custom".
+  const current: Record<string, string> = {};
+  if (!replay) current.replay = "off";
+  if (!dropFinish) current.finish = "keep";
+  for (const [k, v] of Object.entries(groupScale)) current[`g${k}`] = String(v);
+  const same = (a: Record<string, string>, b: Record<string, string>) =>
+    Object.keys(a).length === Object.keys(b).length && Object.entries(a).every(([k, v]) => b[k] === v);
+  const active = SCENARIOS.find((s) => same(s.params, current));
+
+  const href = (params: Record<string, string>) => {
+    const u = new URLSearchParams(params);
+    if (sort !== "rise") u.set("sort", sort);
+    if (search) u.set("q", search);
+    const s = u.toString();
+    return `/goals${s ? `?${s}` : ""}`;
+  };
+  const sortHref = (v: string) => {
+    const u = new URLSearchParams(current);
+    if (v !== "rise") u.set("sort", v);
+    if (search) u.set("q", search);
+    const s = u.toString();
+    return `/goals${s ? `?${s}` : ""}`;
+  };
+  const hidden = (name: string, value: string) => `<input type="hidden" name="${name}" value="${esc(value)}">`;
+  const tile = (k: string, v: string, sub: string) =>
+    `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div><div class="sub">${sub}</div></div>`;
+
+  const why = (r: RefinedGoal) => {
+    const used = usableFeatures(r.goal.features, { useReplay: replay, dropReplayFinish: dropFinish });
+    const live = liveCodes(r);
+    const shown = used.filter((f) => live.some((l) => l.code === f.code && l.source === f.source));
+    if (!shown.length) return `<span class="muted">Nothing that changes the chance</span>`;
+    return shown.map((f) => {
+      const c = live.find((l) => l.code === f.code && l.source === f.source)!;
+      const up = c.applied > 0;
+      return `<span class="tag ${up ? "up" : "down"}" title="“${esc(f.quote)}” — said ${f.source === "pre" ? "before the shot" : "on the replay"}">${up ? "↑" : "↓"} ${esc(featureLabel(f.code))}${f.source === "pre" ? ` <i>before shot</i>` : ""}</span>`;
+    }).join("");
+  };
+
+  const body = `
+  <section class="g-hero">
+    <h2>Goals, re-ranked by what the commentators said</h2>
+    <p>For each of our ${res.goals.length} goals, we start from MoneyPuck’s chance of scoring and adjust it
+       using the broadcast commentary: a pass, a screen or a breakaway raises it. The
+       <strong>total stays fixed at ${res.totalBase.toFixed(1)} expected goals</strong>, so when one goal
+       goes up, the others give up a little. The commentary decides which goals were the better chances.</p>
+  </section>
+
+  <div class="tiles" style="margin-bottom:16px">
+    ${tile("Goals", String(res.goals.length), `from ${nGames} games`)}
+    ${tile("Expected goals", res.totalRefined.toFixed(1), "same total before and after")}
+    ${tile("Moved by the commentary", String(movedBy(res)), `of ${res.goals.length} goals`)}
+    ${tile("Long-shot goals raised", `${longUp} of ${longShots.length}`,
+           "goals MoneyPuck gave under a 5% chance")}
+  </div>
+
+  <form method="get" class="card g-panel">
+    <div class="g-panel-head">
+      <h2>Try a scenario</h2>
+      <span class="muted">${active ? esc(active.blurb) : "Custom settings."}</span>
+    </div>
+    <div class="g-scenarios">
+      ${SCENARIOS.map((s) => `<a class="g-btn${s === active ? " on" : ""}" href="${href(s.params)}">${esc(s.name)}</a>`).join("")}
+    </div>
+    ${active === SCENARIOS[0] ? "" : `<p class="g-banner">In this scenario the commentary moves
+      <strong>${movedBy(res)}</strong> goals (our model: ${movedBy(ours)}).
+      <a href="${href({})}">Back to our model</a></p>`}
+    <details${Object.keys(groupScale).length ? " open" : ""}>
+      <summary>Fine-tune: how much each kind of detail counts</summary>
+      <div class="g-groups">
+        ${GROUPS.map((g) => `<div class="g-group">
+          <div><strong>${esc(g.label)}</strong><div class="muted">e.g. ${esc(GROUP_EXAMPLES[g.key] ?? "")}</div></div>
+          <div class="g-seg">${SCALES.map((s) => `<label><input type="radio" name="g${g.key}" value="${s.v}"
+              ${(groupScale[g.key] ?? 1) === s.v ? "checked" : ""} onchange="this.form.submit()"><span>${s.label}</span></label>`).join("")}</div>
+        </div>`).join("")}
+      </div>
+      <p class="muted">Replay commentary:
+        <label><input type="radio" name="replay" value="on" ${replay ? "checked" : ""} onchange="this.form.submit()"> use</label>
+        <label><input type="radio" name="replay" value="off" ${replay ? "" : "checked"} onchange="this.form.submit()"> ignore</label>
+        &nbsp;·&nbsp; Goalie state said on the replay:
+        <label><input type="radio" name="finish" value="drop" ${dropFinish ? "checked" : ""} onchange="this.form.submit()"> ignore</label>
+        <label><input type="radio" name="finish" value="keep" ${dropFinish ? "" : "checked"} onchange="this.form.submit()"> count</label>
+        <noscript><button type="submit">Apply</button></noscript></p>
+    </details>
+    ${sort !== "rise" ? hidden("sort", sort) : ""}${search ? hidden("q", search) : ""}
+  </form>
+
+  <form method="get" class="g-search">
+    ${Object.entries(current).map(([k, v]) => hidden(k, v)).join("")}
+    ${sort !== "rise" ? hidden("sort", sort) : ""}
+    <input type="search" name="q" value="${esc(search)}" placeholder="Search a player, team or game ID" aria-label="Search goals">
+    <button type="submit">Search</button>
+    ${search ? `<a href="${sortHref(sort).replace(/([?&])q=[^&]*&?/, "$1").replace(/[?&]$/, "")}">Clear</a>` : ""}
+  </form>
+
+  <nav class="g-tabs">
+    ${SORTS.map((s) => `<a href="${sortHref(s.v)}" class="${s.v === sort ? "on" : ""}">${s.label}</a>`).join("")}
+    <span class="muted">${rows.length} goal${rows.length === 1 ? "" : "s"}${sort === "long" ? " MoneyPuck gave under a 5% chance" : ""}</span>
+  </nav>
+
+  <div class="card">
+  ${rows.length === 0 ? `<p class="empty">No goals match${search ? ` “${esc(search)}”` : ""}.</p>` : `
+  <table class="g-table">
+    <thead><tr><th>Goal</th>
+      <th title="Grey dot: MoneyPuck. Coloured dot: after the commentary.">Chance of scoring</th>
+      <th class="num">Change</th>
+      <th class="num" title="Rank among all ${res.goals.length} goals by chance of scoring, 1st = best chance">Rank</th>
+      <th class="hide-sm">Why it moved</th><th></th></tr></thead>
+    <tbody>
+    ${rows.map((r) => {
+      const g = r.goal;
+      const d = change(r);
+      return `<tr>
+      <td><a href="/shot/${g.game_id}/${g.event_id}" class="g-name">${esc(g.shooter ?? "unknown")}</a>
+          <div class="muted g-when" title="Game ${esc(g.game_id)}">${esc(g.team ?? "")} · ${periodName(g.period)}, ${esc(g.clock ?? "")}</div></td>
+      <td><div class="g-xg">${dumbbell(r.xgBase, r.xgRefined, scaleMax)}
+          <span>${pct(r.xgBase)} <span class="muted">→</span> <strong>${pct(r.xgRefined)}</strong></span></div></td>
+      <td class="num"><span class="g-delta ${Math.abs(d) < 0.0005 ? "flat" : d > 0 ? "up" : "down"}">${Math.abs(d) < 0.0005 ? "0.0" : signedPts(d)}</span>
+          <div class="muted g-split" title="From this goal's own commentary, and from the small amount every goal gives up to keep the total fixed">
+            ${r.featureShift !== 0 ? `commentary ${signedPts(fromFeatures(r))} · shared ${signedPts(d - fromFeatures(r))}` : "shared only"}</div></td>
+      <td class="num g-rank">${ordinal(rankBase.get(r)!)} → <strong>${ordinal(rankRef.get(r)!)}</strong></td>
+      <td class="hide-sm">${why(r)}</td>
+      <td><a href="/shot/${g.game_id}/${g.event_id}" class="g-watch" title="watch this goal">▶ Watch</a></td>
+    </tr>`;
+    }).join("")}
+    </tbody></table>`}
+  </div>
+  <p class="muted">Changes are in percentage points. Weights are our hand-set starting values
+     (coefficients ${COEFF_VERSION}); nothing here is fitted yet. This page shows how the commentary
+     re-orders goals; whether the new order is <em>better</em> needs an outside reference, such as
+     hand ratings of the clips. Reproduce the numbers with <code>make goals</code>.</p>`;
+  return c.html(page("Goals – commentary xG", "/goals", body));
 });
 
 app.get("/summary", async (c) => {
