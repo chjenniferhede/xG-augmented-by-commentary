@@ -376,6 +376,7 @@ const SCENARIOS: Scenario[] = [
   { name: "Count goalie on replay", blurb: "Also count “goalie out of position” said on the replay.", params: { finish: "keep" } },
   { name: "Without passing", blurb: "Passes before the shot count for nothing.", params: { gD: "0" } },
   { name: "Without screens", blurb: "Screens and traffic count for nothing.", params: { gA: "0" } },
+  { name: "Budget per game", blurb: "Each game keeps its own total, so goals only compete with goals from the same broadcast.", params: { budget: "game" } },
 ];
 
 const SORTS = [
@@ -410,6 +411,7 @@ app.get("/goals", async (c) => {
   const qp = (k: string) => c.req.query(k) ?? "";
   const replay = qp("replay") !== "off";
   const dropFinish = qp("finish") !== "keep";
+  const perGame = qp("budget") === "game";
   const groupScale: Record<string, number> = {};
   for (const g of GROUPS) {
     const raw = qp(`g${g.key}`);
@@ -421,7 +423,7 @@ app.get("/goals", async (c) => {
 
   const all = await fetchGoals();
   const res = refineGoals(all, {
-    useReplay: replay, dropReplayFinish: dropFinish,
+    useReplay: replay, dropReplayFinish: dropFinish, budget: perGame ? "game" : "pooled",
     ...(Object.keys(groupScale).length ? { groupScale } : {}),
   });
   const ours = refineGoals(all); // "Our model", for comparison when a scenario is active
@@ -461,6 +463,7 @@ app.get("/goals", async (c) => {
   const current: Record<string, string> = {};
   if (!replay) current.replay = "off";
   if (!dropFinish) current.finish = "keep";
+  if (perGame) current.budget = "game";
   for (const [k, v] of Object.entries(groupScale)) current[`g${k}`] = String(v);
   const same = (a: Record<string, string>, b: Record<string, string>) =>
     Object.keys(a).length === Object.keys(b).length && Object.entries(a).every(([k, v]) => b[k] === v);
@@ -501,8 +504,11 @@ app.get("/goals", async (c) => {
     <h2>Goals, re-ranked by what the commentators said</h2>
     <p>For each of our ${res.goals.length} goals, we start from MoneyPuck’s chance of scoring and adjust it
        using the broadcast commentary: a pass, a screen or a breakaway raises it. The
-       <strong>total stays fixed at ${res.totalBase.toFixed(1)} expected goals</strong>, so when one goal
-       goes up, the others give up a little. The commentary decides which goals were the better chances.</p>
+       ${perGame
+         ? `<strong>total stays fixed within each game</strong>, so when one goal goes up, the other goals
+            from the same game give up a little.`
+         : `<strong>total stays fixed at ${res.totalBase.toFixed(1)} expected goals</strong>, so when one goal
+            goes up, the others give up a little.`} The commentary decides which goals were the better chances.</p>
   </section>
 
   <div class="tiles" style="margin-bottom:16px">
@@ -539,6 +545,9 @@ app.get("/goals", async (c) => {
         &nbsp;·&nbsp; Goalie state said on the replay:
         <label><input type="radio" name="finish" value="drop" ${dropFinish ? "checked" : ""} onchange="this.form.submit()"> ignore</label>
         <label><input type="radio" name="finish" value="keep" ${dropFinish ? "" : "checked"} onchange="this.form.submit()"> count</label>
+        &nbsp;·&nbsp; Total held fixed:
+        <label><input type="radio" name="budget" value="pooled" ${perGame ? "" : "checked"} onchange="this.form.submit()"> across all goals</label>
+        <label><input type="radio" name="budget" value="game" ${perGame ? "checked" : ""} onchange="this.form.submit()"> within each game</label>
         <noscript><button type="submit">Apply</button></noscript></p>
     </details>
     ${sort !== "rise" ? hidden("sort", sort) : ""}${search ? hidden("q", search) : ""}
@@ -575,7 +584,7 @@ app.get("/goals", async (c) => {
       <td><div class="g-xg">${dumbbell(r.xgBase, r.xgRefined, scaleMax)}
           <span>${pct(r.xgBase)} <span class="muted">→</span> <strong>${pct(r.xgRefined)}</strong></span></div></td>
       <td class="num"><span class="g-delta ${Math.abs(d) < 0.0005 ? "flat" : d > 0 ? "up" : "down"}">${Math.abs(d) < 0.0005 ? "0.0" : signedPts(d)}</span>
-          <div class="muted g-split" title="From this goal's own commentary, and from the small amount every goal gives up to keep the total fixed">
+          <div class="muted g-split" title="From this goal's own commentary, and from the small amount every goal ${perGame ? "in the game " : ""}gives up to keep the total fixed">
             ${r.featureShift !== 0 ? `commentary ${signedPts(fromFeatures(r))} · shared ${signedPts(d - fromFeatures(r))}` : "shared only"}</div></td>
       <td class="num g-rank">${ordinal(rankBase.get(r)!)} → <strong>${ordinal(rankRef.get(r)!)}</strong></td>
       <td class="hide-sm">${why(r)}</td>

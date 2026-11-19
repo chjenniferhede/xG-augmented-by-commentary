@@ -46,8 +46,14 @@ export interface GoalOptions {
    * keep their weights. Used by the dashboard's sliders; the analysis itself never sets it.
    */
   groupScale?: Readonly<Record<string, number>>;
+  /**
+   * Where the total is held fixed. "pooled": one budget across all goals, so xG can move
+   * between games. "game": each game keeps its own total, so goals are only re-ordered against
+   * goals from the same broadcast -- a crew that describes more cannot pull xG from a quieter one.
+   */
+  budget?: "pooled" | "game";
 }
-export const DEFAULT_OPTIONS: GoalOptions = { useReplay: true, dropReplayFinish: true };
+export const DEFAULT_OPTIONS: GoalOptions = { useReplay: true, dropReplayFinish: true, budget: "pooled" };
 
 /** The vocabulary groups a what-if can scale, in the order the dashboard shows them. */
 export const GROUPS: readonly { key: string; label: string }[] = [
@@ -81,12 +87,17 @@ export interface RefinedGoal<T extends GoalInput = GoalInput> {
   xgRefined: number;
   /** Log-odds shift from this goal's own features, before rebalancing. 0 = no usable features. */
   featureShift: number;
+  /** Log-odds shift shared by every goal in this goal's budget, keeping that budget's total. */
+  rebalance: number;
   contributions: Contribution[];
 }
 
 export interface GoalsResult<T extends GoalInput = GoalInput> {
-  /** Log-odds shift applied to every goal so the total stays at MoneyPuck's. */
-  alpha: number;
+  /**
+   * The shared rebalancing shift (log-odds) with a pooled budget. null with a per-game budget,
+   * where each game has its own: see RefinedGoal.rebalance.
+   */
+  alpha: number | null;
   totalBase: number;
   totalRefined: number;
   goals: RefinedGoal<T>[];
@@ -108,17 +119,31 @@ export function refineGoals<T extends GoalInput>(goals: T[], opts: GoalOptions =
   const baseLogits = goals.map((g) => logit(g.x_goal));
   const shifts = adjusted.map((a) => a.shift);
   const totalBase = goals.reduce((s, g) => s + g.x_goal, 0);
-  const alpha = fitZeroSumAlpha(baseLogits, shifts, totalBase);
+
+  // One budget for all goals, or one per game. Each budget gets its own rebalancing shift.
+  const perGame = opts.budget === "game";
+  const budgets = new Map<string, number[]>();
+  goals.forEach((g, i) => {
+    const key = perGame ? g.game_id : "";
+    budgets.set(key, [...(budgets.get(key) ?? []), i]);
+  });
+  const rebalance = new Array<number>(goals.length).fill(0);
+  for (const idx of budgets.values()) {
+    const a = fitZeroSumAlpha(idx.map((i) => baseLogits[i]!), idx.map((i) => shifts[i]!),
+      idx.reduce((s, i) => s + goals[i]!.x_goal, 0));
+    for (const i of idx) rebalance[i] = a;
+  }
 
   const refined = goals.map((g, i) => ({
     goal: g,
     xgBase: g.x_goal,
-    xgRefined: sigmoid(alpha + baseLogits[i]! + shifts[i]!),
+    xgRefined: sigmoid(rebalance[i]! + baseLogits[i]! + shifts[i]!),
     featureShift: shifts[i]!,
+    rebalance: rebalance[i]!,
     contributions: adjusted[i]!.contributions,
   }));
   return {
-    alpha,
+    alpha: perGame ? null : (rebalance[0] ?? 0),
     totalBase,
     totalRefined: refined.reduce((s, r) => s + r.xgRefined, 0),
     goals: refined,
@@ -184,7 +209,11 @@ async function main(): Promise<void> {
   const moved = res.goals.filter((r) => r.featureShift !== 0);
 
   console.log(`\n${goals.length} goals. MoneyPuck total ${res.totalBase.toFixed(2)}, refined total ${res.totalRefined.toFixed(2)}.`);
-  console.log(`Rebalancing shift (log-odds, applied to every goal): ${res.alpha.toFixed(3)}.`);
+  console.log(`Rebalancing shift (log-odds, applied to every goal): ${(res.alpha ?? 0).toFixed(3)}.`);
+  const perGame = refineGoals(goals, { ...DEFAULT_OPTIONS, budget: "game" });
+  const gap = res.goals.map((r, i) => Math.abs(r.xgRefined - perGame.goals[i]!.xgRefined));
+  console.log(`With a per-game budget instead, goals differ by ${(100 * gap.reduce((s, d) => s + d, 0) / gap.length).toFixed(1)} ` +
+    `points on average (largest ${(100 * Math.max(...gap)).toFixed(1)}).`);
   console.log(`Goals moved by their own features: ${preOnly} using pre-shot commentary only, ` +
     `${moved.length} with the replay (${replayAll} if replay goalie-state features were kept).`);
 

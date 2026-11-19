@@ -26,7 +26,8 @@ test("a goal with no features moves only by the shared rebalancing shift", () =>
   const res = refineGoals(sample);
   const plain = res.goals.find((r) => r.goal.event_id === "4")!;
   assert.equal(plain.featureShift, 0);
-  assert.ok(Math.abs(plain.xgRefined - sigmoid(res.alpha + logit(0.3))) < 1e-12);
+  assert.ok(Math.abs(plain.xgRefined - sigmoid(plain.rebalance + logit(0.3))) < 1e-12);
+  assert.ok(res.goals.every((r) => r.rebalance === res.alpha), "a pooled budget shares one shift");
 });
 
 test("features that raise a goal push it up relative to an unadjusted goal", () => {
@@ -55,6 +56,30 @@ test("scaling a group to zero removes its features' effect and keeps the total",
   assert.equal(res.goals.find((r) => r.goal.event_id === "1")!.featureShift, 0); // backdoor is group D
   assert.ok(res.goals.find((r) => r.goal.event_id === "2")!.featureShift > 0);   // screen is group A
   assert.ok(Math.abs(res.totalRefined - res.totalBase) < 1e-6);
+});
+
+test("a per-game budget keeps each game's total and leaves a featureless game untouched", () => {
+  const twoGames: GoalInput[] = [
+    { ...goal("1", 0.05, [feat("backdoor", "post")]), game_id: "A" },
+    { ...goal("2", 0.20), game_id: "A" },
+    { ...goal("3", 0.10), game_id: "B" },
+    { ...goal("4", 0.30), game_id: "B" },
+  ];
+  const res = refineGoals(twoGames, { ...DEFAULT_OPTIONS, budget: "game" });
+  assert.equal(res.alpha, null);
+  for (const game of ["A", "B"]) {
+    const rs = res.goals.filter((r) => r.goal.game_id === game);
+    const before = rs.reduce((s, r) => s + r.xgBase, 0);
+    const after = rs.reduce((s, r) => s + r.xgRefined, 0);
+    assert.ok(Math.abs(after - before) < 1e-6, `game ${game}: ${after} vs ${before}`);
+  }
+  // Game B has no features, so its goals don't pay for game A's back-door play.
+  for (const r of res.goals.filter((r) => r.goal.game_id === "B")) {
+    assert.ok(Math.abs(r.xgRefined - r.xgBase) < 1e-9);
+  }
+  // With one pooled budget they would.
+  const pooled = refineGoals(twoGames);
+  assert.ok(pooled.goals.find((r) => r.goal.event_id === "4")!.xgRefined < 0.3);
 });
 
 test("with no features anywhere, nothing moves", () => {
