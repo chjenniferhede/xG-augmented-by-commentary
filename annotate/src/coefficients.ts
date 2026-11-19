@@ -151,12 +151,14 @@ export function adjust(
   features: ScoredFeature[],
   relevance: number,
   calib: Calibration = IDENTITY_CALIBRATION,
+  /** Override the weight table, e.g. for a what-if. Defaults to WEIGHTS. */
+  weights: Readonly<Record<string, number>> = WEIGHTS,
 ): AdjustResult {
   const gate = relevance < RELEVANCE_FLOOR ? 0 : relevance;
   const droppedIdx = resolveExclusives(features);
 
   const contributions: Contribution[] = features.map((f, i) => {
-    const weight = WEIGHTS[f.code] ?? 0;
+    const weight = weights[f.code] ?? 0;
     const raw = weight * Math.min(Math.max(f.confidence, 0), 1);
     const c: Contribution = {
       code: f.code, confidence: f.confidence, source: f.source, weight, raw, applied: 0,

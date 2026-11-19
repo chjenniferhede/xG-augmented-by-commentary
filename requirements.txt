@@ -7,5 +7,6 @@ yt-dlp
 imageio-ffmpeg
 rapidocr_onnxruntime
 flask
+matplotlib               # slide figures (scripts/goals_figures.py)
 python-dotenv
 psycopg[binary]==3.2.*   # Postgres (Supabase) when DATABASE_URL is set

@@ -120,6 +120,54 @@ mark { background: color-mix(in oklab, var(--warn) 35%, transparent); color: inh
        padding: 0 2px; border-radius: 3px; }
 .empty { color: var(--muted); padding: 28px 0; text-align: center; }
 code { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* Goals page */
+.g-hero { margin: 4px 0 16px; max-width: 80ch; }
+.g-hero h2 { font-size: 22px; text-transform: none; letter-spacing: -0.01em; color: var(--ink); margin-bottom: 6px; }
+.g-hero p { color: var(--ink-2); font-size: 15px; margin: 0; }
+.g-panel-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.g-panel-head h2 { margin: 0; }
+.g-scenarios { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
+.g-btn { padding: 7px 14px; border-radius: 999px; border: 1px solid var(--border);
+         text-decoration: none; font-size: 13.5px; color: var(--ink-2); background: var(--plane); }
+.g-btn:hover { border-color: var(--axis); color: var(--ink); }
+.g-btn.on { background: var(--up); border-color: var(--up); color: #fff; font-weight: 600; }
+.g-banner { margin: 10px 0 0; padding: 8px 12px; border-radius: 8px; font-size: 13.5px;
+            background: color-mix(in oklab, var(--warn) 16%, transparent); }
+.g-panel details { margin-top: 12px; }
+.g-panel summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+.g-groups { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 10px 24px; margin: 12px 0; }
+.g-group { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+           padding: 8px 0; border-bottom: 1px solid var(--grid); }
+.g-group .muted { font-size: 12px; }
+.g-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; flex: none; }
+.g-seg input { position: absolute; opacity: 0; pointer-events: none; }
+.g-seg span { display: block; padding: 4px 9px; font-size: 12px; cursor: pointer; color: var(--ink-2); }
+.g-seg label + label span { border-left: 1px solid var(--border); }
+.g-seg input:checked + span { background: var(--ink); color: var(--surface-1); font-weight: 600; }
+.g-seg input:focus-visible + span { outline: 2px solid var(--up); }
+.g-search { display: flex; gap: 8px; align-items: center; margin: 4px 0 12px; }
+.g-search input { flex: 1; max-width: 520px; font-size: 15px; padding: 9px 12px; border-radius: 9px; }
+.g-search button, .filters button { font: inherit; padding: 8px 14px; border-radius: 9px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--ink); }
+.g-tabs { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.g-tabs a { padding: 6px 12px; border-radius: 8px; text-decoration: none; color: var(--ink-2); font-size: 13.5px; }
+.g-tabs a.on { background: var(--surface-1); border: 1px solid var(--border); color: var(--ink); font-weight: 600; }
+.g-tabs .muted { margin-left: 8px; font-size: 13px; }
+.g-table td { vertical-align: middle; padding: 10px 9px; }
+.g-name { font-weight: 650; font-size: 14.5px; text-decoration: none; }
+.g-name:hover { text-decoration: underline; }
+.g-xg { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+.g-delta { font-size: 15px; font-weight: 650; }
+.g-delta.up { color: var(--up); } .g-delta.down { color: var(--down); } .g-delta.flat { color: var(--muted); }
+.g-when, .g-rank { white-space: nowrap; }
+.g-split { font-size: 11.5px; white-space: nowrap; }
+.tag { display: inline-block; margin: 2px 4px 2px 0; padding: 2px 9px; border-radius: 999px;
+       font-size: 12.5px; white-space: nowrap; cursor: help; border: 1px solid var(--border); }
+.tag.up { background: color-mix(in oklab, var(--up) 14%, transparent); }
+.tag.down { background: color-mix(in oklab, var(--down) 14%, transparent); }
+.tag i { font-style: normal; font-size: 10.5px; color: var(--muted); }
+.g-watch { white-space: nowrap; text-decoration: none; font-size: 13px; color: var(--ink-2); }
+.g-watch:hover { color: var(--ink); }
 @media (max-width: 720px) {
   main { padding: 12px; } th, td { padding: 6px; }
   .hide-sm { display: none; }
@@ -127,7 +175,7 @@ code { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 `;
 
 export function page(title: string, active: string, body: string): string {
-  const nav = [["/", "Shots"], ["/pre", "Pre-shot"], ["/summary", "Summary"]] as const;
+  const nav = [["/", "Shots"], ["/pre", "Pre-shot"], ["/goals", "Goals"], ["/summary", "Summary"]] as const;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)}</title><style>${CSS}</style></head><body>
