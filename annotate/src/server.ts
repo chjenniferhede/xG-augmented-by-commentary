@@ -19,6 +19,7 @@ import { featureDef, FEATURES } from "./vocabulary.ts";
 import type { ScoredFeature } from "./coefficients.ts";
 import { fetchGoals, GROUPS, liveCodes, refineGoals, usableFeatures, type RefinedGoal } from "./goals.ts";
 import { featureLabel } from "./views/labels.ts";
+import { gameLabel, type GameInfo } from "./views/gameLabel.ts";
 
 const app = new Hono();
 
@@ -420,8 +421,19 @@ app.get("/goals", async (c) => {
   }
   const sort = SORTS.some((s) => s.v === qp("sort")) ? qp("sort") : "rise";
   const search = qp("q").trim();
+  const gameFilter = qp("game").trim();
 
   const all = await fetchGoals();
+  // Names for the game menu. Only games that have goals are listed, oldest first.
+  const goalsPerGame = new Map<string, number>();
+  for (const g of all) goalsPerGame.set(String(g.game_id), (goalsPerGame.get(String(g.game_id)) ?? 0) + 1);
+  const gameInfo = await query<GameInfo>(
+    `SELECT game_id::text AS game_id, to_char(game_date, 'YYYY-MM-DD') AS game_date,
+            away_team, home_team, away_goals, home_goals
+       FROM games WHERE game_id::text = ANY($1) ORDER BY game_date, game_id`,
+    [[...goalsPerGame.keys()]],
+  );
+  const game = goalsPerGame.has(gameFilter) ? gameFilter : "";
   const res = refineGoals(all, {
     useReplay: replay, dropReplayFinish: dropFinish, budget: perGame ? "game" : "pooled",
     ...(Object.keys(groupScale).length ? { groupScale } : {}),
@@ -449,6 +461,7 @@ app.get("/goals", async (c) => {
   const needle = search.toLowerCase();
   const rows = res.goals
     .filter((r) => sort !== "long" || r.xgBase < LONG_SHOT)
+    .filter((r) => !game || String(r.goal.game_id) === game)
     .filter((r) => !needle ||
       `${r.goal.shooter ?? ""} ${r.goal.team ?? ""} ${r.goal.game_id}`.toLowerCase().includes(needle))
     .sort(orders[sort]!);
@@ -472,6 +485,7 @@ app.get("/goals", async (c) => {
   const href = (params: Record<string, string>) => {
     const u = new URLSearchParams(params);
     if (sort !== "rise") u.set("sort", sort);
+    if (game) u.set("game", game);
     if (search) u.set("q", search);
     const s = u.toString();
     return `/goals${s ? `?${s}` : ""}`;
@@ -479,6 +493,7 @@ app.get("/goals", async (c) => {
   const sortHref = (v: string) => {
     const u = new URLSearchParams(current);
     if (v !== "rise") u.set("sort", v);
+    if (game) u.set("game", game);
     if (search) u.set("q", search);
     const s = u.toString();
     return `/goals${s ? `?${s}` : ""}`;
@@ -530,7 +545,7 @@ app.get("/goals", async (c) => {
     ${active === SCENARIOS[0] ? "" : `<p class="g-banner">In this scenario the commentary moves
       <strong>${movedBy(res)}</strong> goals (our model: ${movedBy(ours)}).
       <a href="${href({})}">Back to our model</a></p>`}
-    <details${Object.keys(groupScale).length ? " open" : ""}>
+    <details${!active && Object.keys(groupScale).length ? " open" : ""}>
       <summary>Fine-tune: how much each kind of detail counts</summary>
       <div class="g-groups">
         ${GROUPS.map((g) => `<div class="g-group">
@@ -550,15 +565,20 @@ app.get("/goals", async (c) => {
         <label><input type="radio" name="budget" value="game" ${perGame ? "checked" : ""} onchange="this.form.submit()"> within each game</label>
         <noscript><button type="submit">Apply</button></noscript></p>
     </details>
-    ${sort !== "rise" ? hidden("sort", sort) : ""}${search ? hidden("q", search) : ""}
+    ${sort !== "rise" ? hidden("sort", sort) : ""}${game ? hidden("game", game) : ""}${search ? hidden("q", search) : ""}
   </form>
 
   <form method="get" class="g-search">
     ${Object.entries(current).map(([k, v]) => hidden(k, v)).join("")}
     ${sort !== "rise" ? hidden("sort", sort) : ""}
-    <input type="search" name="q" value="${esc(search)}" placeholder="Search a player, team or game ID" aria-label="Search goals">
+    <select name="game" aria-label="Filter by game" onchange="this.form.submit()">
+      <option value="">All games (${nGames})</option>
+      ${gameInfo.map((gi) => `<option value="${esc(gi.game_id)}"${gi.game_id === game ? " selected" : ""}>
+        ${esc(gameLabel(gi))} · ${goalsPerGame.get(gi.game_id) ?? 0} goals</option>`).join("")}
+    </select>
+    <input type="search" name="q" value="${esc(search)}" placeholder="Search a player or team" aria-label="Search goals">
     <button type="submit">Search</button>
-    ${search ? `<a href="${sortHref(sort).replace(/([?&])q=[^&]*&?/, "$1").replace(/[?&]$/, "")}">Clear</a>` : ""}
+    ${search || game ? `<a href="${sortHref(sort).replace(/([?&])(q|game)=[^&]*/g, "").replace(/\?&/, "?").replace(/[?&]$/, "")}">Clear</a>` : ""}
   </form>
 
   <nav class="g-tabs">
