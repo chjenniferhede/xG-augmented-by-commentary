@@ -33,6 +33,10 @@ class GameDataMissing(Exception):
     """MoneyPuck has no data for this game (yet)."""
 
 
+class GameDataConflict(Exception):
+    """MoneyPuck reused an event ID for different rows; loading would lose data."""
+
+
 def snake(name: str) -> str:
     """MoneyPuck's camelCase column name -> the warehouse's snake_case one.
 
@@ -74,6 +78,16 @@ def load_events(game_id: int) -> pd.DataFrame:
         download(url, path)
     events = pd.read_csv(path)
     events = events.rename(columns={"id": "event_id"})
+    repeated = events[events.duplicated("event_id", keep=False)]
+    conflicts = [event_id for event_id, rows in repeated.groupby("event_id", sort=False)
+                 if len(rows.drop_duplicates()) > 1]
+    if conflicts:
+        raise GameDataConflict(f"MoneyPuck game {game_id} has conflicting rows for event ID(s): "
+                               + ", ".join(str(event_id) for event_id in conflicts[:10]))
+    if not repeated.empty:
+        before = len(events)
+        events = events.drop_duplicates("event_id", keep="first")
+        ops.log.info("game %s: removed %d identical duplicate event row(s)", game_id, before - len(events))
     return pd.concat([pd.Series(game_id, index=events.index, name="game_id"), events], axis=1)
 
 

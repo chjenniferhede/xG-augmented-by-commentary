@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import call, patch
 
 os.environ["XG_DATA_DIR"] = tempfile.mkdtemp(prefix="xg-test-")
 os.environ["DATABASE_URL"] = ""  # SQLite in the temp dir, never the real database from .env
@@ -20,6 +21,7 @@ import build_db  # noqa: E402
 import db  # noqa: E402
 import load_transcript  # noqa: E402
 import ops  # noqa: E402
+import pipeline  # noqa: E402
 
 
 class WarehouseTest(unittest.TestCase):
@@ -61,8 +63,183 @@ class WarehouseTest(unittest.TestCase):
         self.assertEqual(con.execute("SELECT COUNT(*) FROM shot_commentary").fetchone()[0], 0)
 
 
+class MoneyPuckDuplicateEvents(unittest.TestCase):
+    def load_csv(self, rows):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "game.csv"
+            pd.DataFrame(rows).to_csv(path, index=False)
+            with patch.object(build_db, "events_source", return_value=("unused", path)):
+                return build_db.load_events(2020020290)
+
+    def test_identical_event_rows_are_loaded_once(self):
+        events = self.load_csv([
+            {"id": 1, "time": 0, "event": "FAC", "leadWinProbability": 0.5},
+            {"id": 1, "time": 0, "event": "FAC", "leadWinProbability": 0.5},
+            {"id": 2, "time": 12, "event": "SHOT", "leadWinProbability": 0.6},
+        ])
+        self.assertEqual(events["event_id"].tolist(), [1, 2])
+        self.assertEqual(events["game_id"].tolist(), [2020020290, 2020020290])
+
+    def test_conflicting_event_rows_are_rejected(self):
+        with self.assertRaisesRegex(build_db.GameDataConflict, r"2020020290.*297"):
+            self.load_csv([
+                {"id": 297, "time": 3600, "event": "GOFF", "leadWinProbability": 0.9999},
+                {"id": 297, "time": 3600, "event": "GEND", "leadWinProbability": 1.0},
+            ])
+
+
+class GameDataConflictHandling(unittest.TestCase):
+    def test_conflicting_source_waits_for_manual_review(self):
+        video_id = "conflict001"
+        ops.add_video(video_id, "test", "2026-01-01T00:00:00Z", state="transcribed", game_id=2020020290)
+        with patch.object(build_db, "build", side_effect=build_db.GameDataConflict("conflicting ID 297")):
+            pipeline.do_game_data(ops.get_video(video_id), {})
+        row = ops.connect().execute(
+            "SELECT state, next_attempt_at, last_error, attempts FROM videos WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        self.assertEqual(row, ("transcribed", "never", "conflicting ID 297", 0))
+        step = ops.connect().execute(
+            "SELECT status FROM steps WHERE video_id = ? ORDER BY step_id DESC LIMIT 1", (video_id,)
+        ).fetchone()
+        self.assertEqual(step, ("skipped",))
+
+
+class AlignmentSampling(unittest.TestCase):
+    class CachedFrames:
+        duration = 100.0
+        workers = 1
+
+        def __init__(self, clocks):
+            self.clocks = [{"v": float(g), "g": float(g)} for g in clocks]
+            self.batches = []
+            self.read_calls = []
+
+        def readings(self):
+            return self.clocks
+
+        def read(self, v):
+            self.read_calls.append(float(v))
+            return {"v": v, "g": None}
+
+        def read_many(self, vs):
+            self.batches.append(list(vs))
+
+        def save(self):
+            pass
+
+    def test_skips_dense_scan_when_clock_coverage_already_passes(self):
+        frames = self.CachedFrames(range(5, 95, 10))  # 9 of 10 segments
+        segments = [(k * 10, (k + 1) * 10) for k in range(10)]
+        rows = align_video.align(frames, segments, stop_after_coverage=True)
+        self.assertEqual(sum(row[5] == "clock" for row in rows), 9)
+        self.assertEqual(len(frames.batches), 1, "only the coarse pass should run")
+
+    def test_cached_only_builds_rows_without_fetching_frames(self):
+        frames = self.CachedFrames(range(5, 95, 10))
+        segments = [(k * 10, (k + 1) * 10) for k in range(10)]
+        rows = align_video.align(frames, segments, cached_only=True)
+        self.assertEqual(sum(row[5] == "clock" for row in rows), 9)
+        self.assertEqual(frames.batches, [])
+
+    def test_dense_scan_still_runs_below_the_coverage_gate(self):
+        frames = self.CachedFrames(range(5, 85, 10))  # 8 of 10 segments
+        segments = [(k * 10, (k + 1) * 10) for k in range(10)]
+        align_video.align(frames, segments, stop_after_coverage=True)
+        self.assertIn(76.5, frames.read_calls, "the missing ninth segment should be scanned")
+
+    def test_targeted_scan_stops_when_a_new_clock_pins_its_segment(self):
+        class Frames(self.CachedFrames):
+            def read(self, v):
+                row = super().read(v)
+                if abs(v - 76.5) < 0.01:
+                    row = {"v": float(v), "g": 85.0}
+                    self.clocks.append(row)
+                return row
+
+        frames = Frames(range(5, 85, 10))
+        segments = [(k * 10, (k + 1) * 10) for k in range(10)]
+        rows = align_video.align(frames, segments, stop_after_coverage=True)
+        self.assertEqual(sum(row[5] == "clock" for row in rows), 9)
+        self.assertIn(76.5, frames.read_calls)
+        self.assertNotIn(79.5, frames.read_calls, "no more scans after coverage is sufficient")
+
+    def test_other_failed_gate_falls_back_to_dense_scan(self):
+        bug, segments, goals = object(), [(0, 10)], []
+        cached, first, dense = [(0, 10, "cached")], [(0, 10, "sampled")], [(0, 10, "scanned")]
+        with patch.object(align_video, "align", side_effect=[cached, first, dense]) as align_mock, \
+                patch.object(align_video, "quality", side_effect=[
+                    {"passed": False, "coverage": 0.1},
+                    {"passed": False, "coverage": 0.9},
+                    {"passed": True, "coverage": 0.9},
+                ]):
+            rows, metrics = align_video.validated_alignment(bug, segments, goals, "BOS", "MTL")
+        self.assertEqual(rows, dense)
+        self.assertTrue(metrics["passed"])
+        self.assertEqual(align_mock.call_args_list, [
+            call(bug, segments, cached_only=True),
+            call(bug, segments, stop_after_coverage=True), call(bug, segments),
+        ])
+
+    def test_passing_cached_alignment_never_samples(self):
+        bug, segments, goals = object(), [(0, 10)], []
+        cached = [(0, 10, "cached")]
+        with patch.object(align_video, "align", return_value=cached) as align_mock, \
+                patch.object(align_video, "quality", return_value={"passed": True, "coverage": 0.9}):
+            rows, metrics = align_video.validated_alignment(bug, segments, goals, "BOS", "MTL")
+        self.assertEqual(rows, cached)
+        self.assertTrue(metrics["passed"])
+        align_mock.assert_called_once_with(bug, segments, cached_only=True)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClockCandidateRanking(unittest.TestCase):
+    def test_ranked_percentage_split_across_tokens_is_not_a_clock(self):
+        words = [["82.6", [413, 68, 483, 99]], ["%", [478, 70, 492, 83]],
+                 ["RANK", [519, 69, 554, 82]], ["3RD", [519, 81, 554, 97]]]
+        self.assertEqual(align_video.parse_clock(words, True), (None, None, None))
+
+    def test_stylized_first_period_one_read_as_l(self):
+        words = [["lst", [449, 24, 492, 54]], ["19:15", [510, 24, 578, 54]]]
+        self.assertEqual(align_video.parse_clock(words, False), ("1ST", 1155, 45))
+        self.assertEqual(align_video.parse_clock(["LAST 19:15"], False), (None, None, None))
+
+    def test_shift_timer_below_scoreboard_does_not_replace_game_clock(self):
+        words = [["1ST", [409, 36, 448, 60]], ["4:35", [463, 39, 529, 62]],
+                 ["1:04", [424, 89, 458, 106]]]
+        self.assertEqual(align_video.parse_clock(words, False)[2], 925)
+
+    def test_shot_speed_does_not_replace_minute_second_clock(self):
+        words = [["78.9", [344, 36, 385, 56]], ["3RD", [405, 38, 449, 61]],
+                 ["16:39", [458, 40, 537, 61]]]
+        self.assertEqual(align_video.parse_clock(words, False)[2], 2601)
+        self.assertAlmostEqual(align_video.parse_clock(words[:2], False)[2], 3521.1)
+
+
+class BroadcastPeriodCorrection(unittest.TestCase):
+    def test_exact_stale_labels_are_corrected_without_changing_ocr(self):
+        bug = align_video.Scoreboard("60-5C9m7lZo", playoff=False)
+        source = {}
+        for v, clock in align_video.PERIOD_CORRECTIONS[bug.video_id].items():
+            tokens = [["2ND", [856, 35, 905, 60]],
+                      [f"{clock // 60}:{clock % 60:02}", [898, 36, 974, 58]]]
+            source[f"{v:.1f}"] = {"v": v, "tokens": tokens}
+        bug.cache = source
+        readings = bug.readings()
+        self.assertEqual([r["g"] for r in readings],
+                         [3600 - c for c in align_video.PERIOD_CORRECTIONS[bug.video_id].values()])
+        self.assertTrue(all(r["period"] == "3RD" for r in readings))
+        self.assertTrue(all(r["tokens"][0][0] == "2ND" for r in readings),
+                        "preserve the broadcast's original label in cached OCR")
+
+        other = align_video.Scoreboard("another_vid", playoff=False)
+        self.assertEqual(other._parsed(source["3435.0"])["g"], 1244)
+        wrong_clock = {"v": 3435.0, "tokens": [["2ND", [856, 35, 905, 60]],
+                                                 ["19:15", [898, 36, 974, 58]]]}
+        self.assertEqual(bug._parsed(wrong_clock)["g"], 1245)
 
 
 class ScoreConsistency(unittest.TestCase):

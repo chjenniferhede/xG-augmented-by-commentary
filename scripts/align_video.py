@@ -60,6 +60,12 @@ FRAME_WORKERS = int(os.environ.get("XG_ALIGN_WORKERS", "1"))  # parallel frame f
 # the median per segment absorbs an occasional one.
 GATE = {"min_coverage": 0.9, "max_reversals": 0.01, "min_score_match": 0.9, "min_score_readings": 10}
 TEAM_ALIASES = {"SJS": ["SJ"], "TBL": ["TB"], "NJD": ["NJ"], "LAK": ["LA"], "VGK": ["VEG", "VGK"]}
+# This broadcast kept the 2ND label for five frames after the third period began.
+# The original OCR stays in the frame index; only these exact observed clock readings
+# are corrected. The next frame reads 3RD 19:02 while the power-play clock continues.
+PERIOD_CORRECTIONS = {"60-5C9m7lZo": {
+    3435.0: 1156, 3442.5: 1149, 3446.2: 1145, 3448.1: 1143, 3448.6: 1143,
+}}
 # quality() metrics, stored as columns of the alignments table
 METRIC_COLUMNS = ("passed", "segments", "pinned_by_clock", "coverage", "clock_reversals", "readings",
                   "video_cuts", "score_readings", "score_match", "frames_cached", "frames_fetched")
@@ -93,7 +99,7 @@ def ocr(img: np.ndarray) -> list:
 
 # A digit may follow the label directly: OCR often merges "1st 16:28" into "1st16:28".
 # OCR also reads the O of "OT" as a zero ("0T17:20").
-PERIOD_RE = re.compile(r"(?<![A-Z0-9])(1ST|2ND|3RD|P[1-3]|[2-5]?[O0]T)(?![A-Z])")
+PERIOD_RE = re.compile(r"(?<![A-Z0-9])(1ST|LST|2ND|3RD|P[1-3]|[2-5]?[O0]T)(?![A-Z])")
 CLOCK_RE = re.compile(r"(?<![\d:.])(?:(\d{1,2}):(\d{2})|:?(\d{1,2})\.(\d))(?![\d])")
 
 
@@ -103,6 +109,8 @@ def _game_time(label: str, cm, playoff: bool):
     Game seconds follow MoneyPuck: periods of 1200 s, then a 300 s overtime in the regular
     season, or 1200 s overtimes in the playoffs.
     """
+    if label == "LST":  # the stylized lowercase 1 on some broadcasts OCRs as l
+        label = "1ST"
     if cm.group(1):
         mm, ss = int(cm.group(1)), int(cm.group(2))
         if ss >= 60:
@@ -155,6 +163,12 @@ def read_clock(words: list, playoff: bool):
                 cm = CLOCK_RE.fullmatch(t2.strip())
                 if not cm or b2 is box:
                     continue
+                if cm.group(3) and any(
+                    "%" in t3 and -0.5 * (b2[3] - b2[1]) <= b3[0] - b2[2] <= (b2[3] - b2[1])
+                    and abs((b3[1] + b3[3]) / 2 - (b2[1] + b2[3]) / 2) < b2[3] - b2[1]
+                    for t3, b3 in words
+                ):
+                    continue  # a split percentage on a statistics graphic is not a clock
                 same_line = abs((b2[1] + b2[3]) / 2 - cy) < 0.6 * h and max(b2[0] - box[2], box[0] - b2[2]) < 4 * h
                 stacked = (min(box[2], b2[2]) - max(box[0], b2[0]) > -h / 2
                            and max(b2[1] - box[3], box[1] - b2[3]) < 1.5 * h)
@@ -163,7 +177,12 @@ def read_clock(words: list, playoff: bool):
                 hit = _game_time(pm.group(1), cm, playoff)
                 if not hit:
                     continue
-                dist = abs((b2[0] + b2[2]) / 2 - (box[0] + box[2]) / 2) + abs((b2[1] + b2[3]) / 2 - cy)
+                # Lower-row shift timers and same-row shot speeds can be slightly closer
+                # than the actual game clock. Keep stacked clocks eligible, but prefer
+                # vertical alignment and a minute:second reading when both are present.
+                dist = (abs((b2[0] + b2[2]) / 2 - (box[0] + box[2]) / 2)
+                        + 2 * abs((b2[1] + b2[3]) / 2 - cy)
+                        + (25 if cm.group(3) else 0))
                 if best is None or dist < best[0]:
                     merged = [min(box[0], b2[0]), min(box[1], b2[1]), max(box[2], b2[2]), max(box[3], b2[3])]
                     best = (dist, (*hit, merged))
@@ -315,7 +334,9 @@ class Scoreboard:
         index = raw_store.read_json(self.index_path) if self.index_path.exists() else {}
         self.duration = index.get("duration")
         self.box = index.get("box")  # [y0, y1, x0, x1] in the 720p frame
-        self.cache = index.get("readings", {})
+        # Older runs saved failed frame fetches as empty readings. They must be fetched again.
+        self.cache = {k: r for k, r in index.get("readings", {}).items()
+                      if r.get("crop") or r.get("tokens")}
         self.lock = threading.Lock()
         self._url = None
         self._url_at = 0.0
@@ -441,16 +462,29 @@ class Scoreboard:
                 r.update(tokens=self._tokens(img), ocr_version=OCR_VERSION)
             return self._parsed(r)
         frame = self._grab(v)
-        r = {"v": round(v, 1), "crop": None, "tokens": [], "ocr_version": OCR_VERSION}
-        if frame is not None:
-            y0, y1, x0, x1 = self.box
-            crop = frame[y0:y1, x0:x1]
-            r["crop"] = f"{key}.jpg"
-            raw_store.write_bytes(self.dir / r["crop"], self._jpeg(crop))
-            r["tokens"] = self._tokens(crop)
+        if frame is None:
+            # A timed-out or failed fetch is not an OCR reading. Retry it on the next run.
+            return self._parsed({"v": round(v, 1), "crop": None, "tokens": [],
+                                 "ocr_version": OCR_VERSION})
+        r = {"v": round(v, 1), "crop": f"{key}.jpg", "tokens": [],
+             "ocr_version": OCR_VERSION}
+        y0, y1, x0, x1 = self.box
+        crop = frame[y0:y1, x0:x1]
+        raw_store.write_bytes(self.dir / r["crop"], self._jpeg(crop))
+        r["tokens"] = self._tokens(crop)
         with self.lock:
             self.cache[key] = r
         return self._parsed(r)
+
+    def refresh_cached_ocr(self) -> None:
+        """Re-OCR old saved crops before a cache-only quality decision, without network access."""
+        stale = [key for key, r in self.cache.items()
+                 if r.get("crop") and r.get("ocr_version") != OCR_VERSION
+                 and (self.dir / r["crop"]).exists()]
+        for key in stale:
+            self.read(float(key))  # cached crop path; _grab is never called
+        if stale:
+            self.save()
 
     @staticmethod
     def _tokens(img: np.ndarray) -> list:
@@ -459,6 +493,9 @@ class Scoreboard:
 
     def _parsed(self, r: dict) -> dict:
         label, clock, g = parse_clock(r["tokens"], self.playoff)
+        expected = PERIOD_CORRECTIONS.get(self.video_id, {}).get(r["v"])
+        if expected is not None and label == "2ND" and clock == expected:
+            label, g = "3RD", g + 1200
         return {**r, "period": label, "clock": clock, "g": g}
 
     def read_many(self, vs):
@@ -491,7 +528,8 @@ def play_segments(events):
     return [(a, b) for a, b in zip(faceoffs, faceoffs[1:] + [end]) if b > a]
 
 
-def align(bug: Scoreboard, segments):
+def align(bug: Scoreboard, segments, *, stop_after_coverage: bool = False,
+          cached_only: bool = False):
     def seg_of(g):
         for k, (a, b) in enumerate(segments):
             if a + MARGIN < g < b - MARGIN:
@@ -513,6 +551,9 @@ def align(bug: Scoreboard, segments):
                 found.setdefault(k, []).append(r["v"] - r["g"])
         return found
 
+    def coverage_ready():
+        return bool(segments) and len(pinned()) / len(segments) >= GATE["min_coverage"]
+
     def bisect(k, max_reads=10):
         for _ in range(max_reads):
             lo, hi = bracket(k)
@@ -531,21 +572,38 @@ def align(bug: Scoreboard, segments):
     def scan(k, step=3.0):
         lo, hi = bracket(k)
         v_lo, v_hi = (lo["v"] if lo else 0.0), (hi["v"] if hi else bug.duration)
-        bug.read_many(list(np.arange(v_lo + step / 2, v_hi, step)))
+        times = np.arange(v_lo + step / 2, v_hi, step)
+        if stop_after_coverage:
+            for v in times:
+                r = bug.read(float(v))
+                if coverage_ready() or (r["g"] is not None and seg_of(r["g"]) == k):
+                    return
+        else:
+            bug.read_many(list(times))
 
-    try:
-        bug.read_many([float(v) for v in np.arange(COARSE_STEP / 4, bug.duration, COARSE_STEP)])
-        for stage in (bisect, scan):
-            missing = [k for k in range(len(segments)) if k not in pinned()]
-            if bug.workers > 1:  # segments are independent: search several at once
-                with ThreadPoolExecutor(bug.workers) as ex:
-                    list(ex.map(stage, missing))
-            else:
-                for k in missing:
-                    stage(k)
-            bug.save()
-    finally:
-        bug.save()  # keep every frame read, even if the run stops early (block, budget)
+    if not cached_only:
+        try:
+            bug.read_many([float(v) for v in np.arange(COARSE_STEP / 4, bug.duration, COARSE_STEP)])
+            for stage in (bisect, scan):
+                if stop_after_coverage and coverage_ready():
+                    break
+                missing = [k for k in range(len(segments)) if k not in pinned()]
+                if stop_after_coverage:
+                    # One missing segment at a time lets us stop as soon as enough clocks
+                    # are pinned. The full fallback retains the original parallel scan.
+                    for k in missing:
+                        stage(k)
+                        if coverage_ready():
+                            break
+                elif bug.workers > 1:  # segments are independent: search several at once
+                    with ThreadPoolExecutor(bug.workers) as ex:
+                        list(ex.map(stage, missing))
+                else:
+                    for k in missing:
+                        stage(k)
+                bug.save()
+        finally:
+            bug.save()  # keep every frame read, even if the run stops early (block, budget)
 
     found = pinned()
     rows = []
@@ -605,6 +663,20 @@ def quality(bug: Scoreboard, seg_rows, goals, away: str, home: str) -> dict:
             "video_cuts": cuts,
             "score_readings": checked, "score_match": None if score_match is None else round(score_match, 3),
             "frames_cached": len(bug.cache), "frames_fetched": bug.new_frames}
+
+
+def validated_alignment(bug: Scoreboard, segments, goals, away: str, home: str):
+    """Try the saved clocks first; scan densely if another quality gate still fails."""
+    seg_rows = align(bug, segments, cached_only=True)
+    metrics = quality(bug, seg_rows, goals, away, home)
+    if metrics["passed"]:
+        return seg_rows, metrics
+    seg_rows = align(bug, segments, stop_after_coverage=True)
+    metrics = quality(bug, seg_rows, goals, away, home)
+    if not metrics["passed"] and metrics["coverage"] >= GATE["min_coverage"]:
+        seg_rows = align(bug, segments)
+        metrics = quality(bug, seg_rows, goals, away, home)
+    return seg_rows, metrics
 
 
 def event_video_times(events, seg_rows):
@@ -682,8 +754,9 @@ def main(video_id: str, workers: int = FRAME_WORKERS) -> dict:
 
     bug = Scoreboard(video_id, playoff=game_type == "playoff", workers=workers)
     bug.locate()
-    seg_rows = align(bug, play_segments(events))
-    metrics = quality(bug, seg_rows, goals, away, home)
+    bug.refresh_cached_ocr()
+    segments = play_segments(events)
+    seg_rows, metrics = validated_alignment(bug, segments, goals, away, home)
 
     with con:
         alignment_id = con.execute(

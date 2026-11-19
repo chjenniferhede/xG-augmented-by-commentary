@@ -7,6 +7,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
 
 os.environ["XG_DATA_DIR"] = tempfile.mkdtemp(prefix="xg-test-")
 os.environ["DATABASE_URL"] = ""  # SQLite in the temp dir, never the real database from .env
@@ -15,7 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import ops  # noqa: E402
 import pipeline  # noqa: E402
 import ratelimit  # noqa: E402
-from align_video import parse_clock, parse_score  # noqa: E402
+from align_video import Scoreboard, parse_clock, parse_score  # noqa: E402
+import paths  # noqa: E402
+import raw_store  # noqa: E402
 
 
 class IpBlocked(Exception):
@@ -159,6 +164,54 @@ class LimiterTest(unittest.TestCase):
                 ratelimit.gate("nhl")
         finally:
             ratelimit.offline = False
+
+
+class FrameRetryTest(unittest.TestCase):
+    def test_cache_only_refreshes_old_ocr_from_saved_crop(self):
+        video_id = "OLDCROP0001"
+        index = paths.FRAMES / video_id / "index.json"
+        raw_store.write_json(index, {"duration": 10, "box": [0, 2, 0, 2],
+                                   "readings": {"5.0": {"v": 5.0, "crop": "5.0.jpg",
+                                                        "tokens": [], "ocr_version": 1}}})
+        raw_store.write_bytes(index.parent / "5.0.jpg",
+                              Scoreboard._jpeg(np.zeros((2, 2, 3), dtype=np.uint8)))
+        board = Scoreboard(video_id, playoff=False)
+        with patch.object(board, "_grab", side_effect=AssertionError("network fetch")), \
+                patch.object(board, "_tokens", return_value=[["1ST 19:00", [0, 0, 2, 2]]]):
+            board.refresh_cached_ocr()
+        self.assertEqual(board.readings()[0]["g"], 60)
+        self.assertEqual(raw_store.read_json(index)["readings"]["5.0"]["ocr_version"], 2)
+
+    def test_failed_frame_is_retried_including_legacy_empty_cache(self):
+        video_id = "RETRYFRAME1"
+        index = paths.FRAMES / video_id / "index.json"
+        raw_store.write_json(index, {"duration": 10, "box": [0, 2, 0, 2],
+                                     "readings": {"5.0": {"v": 5.0, "crop": None,
+                                                          "tokens": [], "ocr_version": 2}}})
+        board = Scoreboard(video_id, playoff=False)
+        self.assertNotIn("5.0", board.cache)
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        tokens = [["1ST 19:00", [0, 0, 2, 2]]]
+        with patch.object(board, "_grab", side_effect=[None, frame]) as grab, \
+             patch.object(board, "_tokens", return_value=tokens):
+            self.assertIsNone(board.read(5.0)["g"])
+            board.save()
+            self.assertNotIn("5.0", raw_store.read_json(index)["readings"])
+            self.assertEqual(board.read(5.0)["g"], 60)
+            self.assertEqual(board.read(5.0)["g"], 60)
+        self.assertEqual(grab.call_count, 2)
+        self.assertIn("5.0", board.cache)
+
+    def test_fetched_frame_without_readable_clock_stays_cached(self):
+        board = Scoreboard("EMPTYCLOCK1", playoff=False)
+        board.box = [0, 2, 0, 2]
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        with patch.object(board, "_grab", return_value=frame) as grab, \
+             patch.object(board, "_tokens", return_value=[]):
+            self.assertIsNone(board.read(5.0)["g"])
+            self.assertIsNone(board.read(5.0)["g"])
+        self.assertEqual(grab.call_count, 1)
+        self.assertEqual(board.cache["5.0"]["crop"], "5.0.jpg")
 
 
 class ParseTest(unittest.TestCase):

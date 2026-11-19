@@ -162,6 +162,11 @@ def do_game_data(v: dict, summary: dict) -> bool:
                 else:
                     ops.update_video(v["video_id"], last_error=str(e),
                                      next_attempt_at=later(RETRY["game_data_missing"]))
+            except build_db.GameDataConflict as e:
+                # A conflicting source row will not change on a timed retry. Keep the
+                # transcript, but require a deliberate source review before retrying.
+                s.status, s.note = "skipped", str(e)
+                ops.update_video(v["video_id"], last_error=str(e), next_attempt_at="never")
     except Exception as e:
         failed(v["video_id"], e, v["attempts"])
     return True
