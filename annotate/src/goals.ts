@@ -24,6 +24,7 @@ import { assertSchema, close, loadEnv, query, REPO_ROOT } from "./db.ts";
 import { adjust, IDENTITY_CALIBRATION, logit, sigmoid, WEIGHTS, type Contribution, type ScoredFeature } from "./coefficients.ts";
 import { fitZeroSumAlpha } from "./stats.ts";
 import { featureDef } from "./vocabulary.ts";
+import { featureLabel } from "./views/labels.ts";
 
 /**
  * Goalie-state features that, said on a goal's replay, usually describe the moment the puck went
@@ -214,7 +215,29 @@ async function main(): Promise<void> {
   ].map(csvCell).join(","));
   const file = join(dir, "goals.csv");
   writeFileSync(file, [header.join(","), ...body].join("\n") + "\n");
-  console.log(`\nWrote ${file}`);
+
+  // The counts the slide figures need (scripts/goals_figures.py), so no number is retyped.
+  const [shots] = await query<{ n: number }>(
+    `SELECT COUNT(*)::int AS n FROM commentary_xg c JOIN shot_commentary_split s USING (game_id, event_id)
+      WHERE c.x_goal IS NOT NULL AND s.goal IS NOT NULL`,
+  );
+  const summary = {
+    shots: shots?.n ?? 0,
+    games: new Set(goals.map((g) => g.game_id)).size,
+    goals: goals.length,
+    total_xg: Number(res.totalBase.toFixed(4)),
+    moved_pre_only: preOnly,
+    moved_with_replay: moved.length,
+    long_shot_cutoff: 0.05,
+    long_shots: low.length,
+    long_shots_raised: lowUp.length,
+    long_shots_now_above_cutoff: low.filter((r) => r.xgRefined >= 0.05).length,
+    feature_counts: [...counts].sort((a, b) => b[1] - a[1])
+      .map(([code, n]) => ({ code, label: featureLabel(code), goals: n })),
+  };
+  const summaryFile = join(dir, "goals_summary.json");
+  writeFileSync(summaryFile, JSON.stringify(summary, null, 2) + "\n");
+  console.log(`\nWrote ${file}\nWrote ${summaryFile}`);
   await close();
 }
 

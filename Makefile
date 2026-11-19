@@ -80,8 +80,9 @@ recompute:  ## re-score stored features against the current coefficients; no mod
 calibrate:  ## normalise the adjusted xG and score it against real goals
 	$(NPM) run calibrate
 
-goals:  ## re-rank the goals by their commentary, total xG held fixed; writes data/out/goals.csv
+goals:  ## re-rank the goals by their commentary (total xG held fixed); writes data/out/ table + slide figures
 	$(NPM) run goals
+	$(PY) scripts/goals_figures.py
 
 eval-gold:  ## score extraction against the hand-labelled gold set
 	$(NPM) run eval-gold
